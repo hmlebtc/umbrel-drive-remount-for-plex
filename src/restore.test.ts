@@ -222,18 +222,20 @@ test("restore: a second concurrent start() while a job is running is rejected", 
 });
 
 // ---------------------------------------------------------------------------
-// Fix #5: recreate tries `umbreld client` FIRST (before umbreld-client / docker).
+// v0.1.1: recreate goes STRAIGHT to `docker compose` — no umbreld CLI exists on
+// umbrelOS (the two `umbreld*` attempts, which exited 1/127 on the real box,
+// are removed), so the compose recreate is the single path.
 // ---------------------------------------------------------------------------
 
-test("restore: recreate attempts `umbreld client` first", async () => {
+test("restore: recreate goes straight to docker compose (no umbreld attempts)", async () => {
   const { runner } = runScenario("bindMissing");
   runner.start("manual");
   const job = await waitForJobDone(runner);
 
   assert.equal(stepState(job, "recreate"), "ok");
   const log = stepLog(job, "recreate");
-  assert.match(log, /umbreld client/, "should attempt the `umbreld client` form first");
-  assert.match(log, /recreated via umbreld client/, "should succeed via `umbreld client` in the mock");
+  assert.match(log, /recreated via docker compose/, "recreate should succeed via docker compose");
+  assert.doesNotMatch(log, /umbreld/, "recreate must not attempt any umbreld CLI");
 });
 
 // ---------------------------------------------------------------------------

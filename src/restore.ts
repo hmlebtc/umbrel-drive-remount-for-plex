@@ -9,9 +9,9 @@
  *   - recreate is CONDITIONAL: it is skipped when the running Plex container
  *     already carries the media bind and nothing forced it; a "restart-plex"
  *     trigger always forces it,
- *   - the Plex recreate prefers umbreld-native restart and falls back to
- *     `docker compose ... up -d --force-recreate` with APP_ID / APP_DATA_DIR /
- *     UMBREL_ROOT / DEVICE_HOSTNAME (hostname read live) passed as nsenter env.
+ *   - the Plex recreate runs `docker compose ... up -d --force-recreate` with
+ *     APP_ID / APP_DATA_DIR / UMBREL_ROOT / DEVICE_HOSTNAME (hostname read live)
+ *     passed as nsenter env — no umbreld CLI exists on umbrelOS to try first.
  *
  * start() is synchronous single-flight (so POST /api/restore can 409 without
  * awaiting); the job itself runs asynchronously, deferred to a macrotask so a
@@ -334,12 +334,12 @@ class RestoreRunnerImpl implements RestoreRunner {
   }
 
   /**
-   * Recreate Plex. The umbreld CLI form is unverified across umbrelOS versions,
-   * so we try the known candidates IN ORDER, logging each attempt, and fall back
-   * to the user's proven direct `docker compose` invocation last:
-   *   1. `umbreld client apps.restart.mutate --appId=<id>`
-   *   2. `umbreld-client apps.restart.mutate --appId=<id>`
-   *   3. `docker compose -f <compose> up -d --force-recreate` (with app env)
+   * Recreate Plex via the user's proven direct `docker compose` invocation.
+   * Neither `umbreld client` nor `umbreld-client` exists on umbrelOS (on the real
+   * box they exit 1 / 127), so the compose recreate — `docker compose -f <compose>
+   * up -d --force-recreate --no-deps server` with APP_ID / APP_DATA_DIR /
+   * UMBREL_ROOT / DEVICE_HOSTNAME (hostname read live) passed as nsenter env — is
+   * the SINGLE recreate path.
    */
   private async recreatePlex(step: JobStep, settings: Settings): Promise<boolean> {
     const hostname = await this.adapter.hostname();
@@ -350,21 +350,6 @@ class RestoreRunnerImpl implements RestoreRunner {
       DEVICE_HOSTNAME: hostname,
     };
 
-    const umbreldAttempts: Array<{ label: string; argv: string[] }> = [
-      { label: 'umbreld client', argv: ['umbreld', 'client', 'apps.restart.mutate', `--appId=${settings.plexAppId}`] },
-      { label: 'umbreld-client', argv: ['umbreld-client', 'apps.restart.mutate', `--appId=${settings.plexAppId}`] },
-    ];
-    for (const attempt of umbreldAttempts) {
-      this.logLine(step, `attempting Plex restart via \`${attempt.label}\``);
-      const r = await this.adapter.exec(attempt.argv);
-      if (r.code === 0) {
-        this.logLine(step, `recreated via ${attempt.label}`);
-        return true;
-      }
-      this.logLine(step, `${attempt.label} unavailable (code ${r.code}); trying next`);
-    }
-
-    this.logLine(step, 'falling back to direct docker compose recreate');
     const compose = await this.adapter.exec(
       ['docker', 'compose', '-p', settings.plexAppId, '-f', composePath(settings), 'up', '-d', '--force-recreate', '--no-deps', 'server'],
       { env },

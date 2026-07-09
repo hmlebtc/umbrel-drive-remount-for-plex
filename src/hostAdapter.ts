@@ -16,7 +16,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdir, readdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 
 import { DockerApi } from './dockerApi.js';
@@ -115,16 +115,17 @@ export class RealHostAdapter implements HostAdapter {
   }
 
   async realpath(hostPath: string): Promise<string | null> {
-    try {
-      const resolved = await realpath(toHostView(hostPath));
-      if (resolved.startsWith(HOST_ROOT)) {
-        const stripped = resolved.slice(HOST_ROOT.length);
-        return stripped === '' ? '/' : stripped;
-      }
-      return resolved;
-    } catch {
-      return null;
-    }
+    // Resolve in the HOST mount namespace via nsenter, NOT with fs.realpath().
+    // fs.realpath() canonicalizes /proc/1/root/<path> in userspace: it readlink-
+    // resolves the /proc/1/root MAGIC symlink, which points at "/", so resolution
+    // escapes into THIS container's own rootfs — where the host device node
+    // (e.g. /dev/disk/by-uuid/<uuid> -> /dev/sdX) does not exist. It then throws
+    // and we wrongly report "no device path". (exists() avoids this because the
+    // kernel resolves /proc/1/root specially during in-kernel lstat path-walk.)
+    // `readlink -f` inside the host namespace canonicalizes against PID 1's root.
+    const r = await this.exec(['readlink', '-f', hostPath]);
+    const out = r.stdout.trim();
+    return r.code === 0 && out !== '' ? out : null;
   }
 
   async readProcMounts(): Promise<string> {

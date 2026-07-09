@@ -6,7 +6,7 @@
  * container's docker state.
  *
  * CRITICAL: actions CONVERGE. `mount` adds a fresh (non-stale) mount entry;
- * `umount` removes it; a Plex recreate (umbreld-client or `docker compose up`)
+ * `umount` removes it; a Plex recreate (`docker compose up`)
  * re-reads the CURRENT compose file and rebuilds the container's binds from it —
  * so once composePatch has written the media bind, a recreate makes the
  * container actually carry it. That is what lets a real restore run in MOCK=1
@@ -309,16 +309,6 @@ class MockHostAdapterImpl implements MockHostAdapter {
         const target = argv[argv.length - 1] ?? '';
         return this.state.mounts.some((m) => m.target === target) ? ok() : fail(1);
       }
-      case 'umbreld':
-        // `umbreld client apps.restart.mutate --appId=...`
-        if (argv[1] === 'client') {
-          this.doRecreate();
-          return ok('recreated via umbreld client');
-        }
-        return ok();
-      case 'umbreld-client':
-        this.doRecreate();
-        return ok('recreated via umbreld-client');
       case 'docker':
         if (argv.includes('up') || argv.includes('restart')) {
           this.doRecreate();

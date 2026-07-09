@@ -601,10 +601,14 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       if (d.device) lines.push('<span class="mono">' + esc(d.device) + "</span>");
       else lines.push('<span class="muted">no device path reported</span>');
     } else if (key === "mount") {
-      if (d.source) lines.push("source: " + '<span class="mono">' + esc(d.source) + "</span>");
-      if (d.target) lines.push("target: " + '<span class="mono">' + esc(d.target) + "</span>");
-      if (d.fsType) lines.push("fs: " + esc(d.fsType) + (d.rw === false ? " (read-only)" : ""));
-      if (d.stale === true) lines.push('<span class="warn-t">stale mount</span>');
+      if (!d.mounted) {
+        lines.push('<span class="muted">not mounted</span>');
+      } else {
+        if (d.source) lines.push("source: " + '<span class="mono">' + esc(d.source) + "</span>");
+        if (d.target) lines.push("target: " + '<span class="mono">' + esc(d.target) + "</span>");
+        if (d.fsType) lines.push("fs: " + esc(d.fsType) + (d.rw === false ? " (read-only)" : ""));
+        if (d.stale === true) lines.push('<span class="warn-t">stale mount</span>');
+      }
     } else if (key === "bootHook") {
       if (d.path) lines.push('<span class="mono">' + esc(d.path) + "</span>");
       lines.push(problemsHtml(d.problems));
