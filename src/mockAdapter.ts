@@ -27,6 +27,7 @@ export type MockScenario =
   | 'notMounted'
   | 'mountStale'
   | 'bindMissing'
+  | 'bindWrongSource'
   | 'composeUnpatched'
   | 'hookMissing'
   | 'plexStopped';
@@ -71,6 +72,8 @@ function normalizeScenario(raw: string): MockScenario | null {
     mountstale: 'mountStale',
     'bind-missing': 'bindMissing',
     bindmissing: 'bindMissing',
+    'bind-wrong-source': 'bindWrongSource',
+    bindwrongsource: 'bindWrongSource',
     'compose-unpatched': 'composeUnpatched',
     composeunpatched: 'composeUnpatched',
     'hook-missing': 'hookMissing',
@@ -182,6 +185,15 @@ class MockHostAdapterImpl implements MockHostAdapter {
         // Compose IS patched, but the running container predates the patch.
         state.container.binds = this.bindsFromCompose(BASE_COMPOSE);
         break;
+      case 'bindWrongSource':
+        // Compose IS patched and the container has a bind to the right
+        // destination, but its host source is STALE (e.g. an old mount path) —
+        // must be treated as bind-missing (media not actually visible).
+        state.container.binds = this.bindsFromCompose(BASE_COMPOSE).concat({
+          source: '/mnt/OLDPATH/media',
+          destination: this.s.containerMediaPath,
+        });
+        break;
       case 'composeUnpatched':
         state.files.set(composePath(this.s), BASE_COMPOSE);
         state.container.binds = this.bindsFromCompose(BASE_COMPOSE);
@@ -246,6 +258,14 @@ class MockHostAdapterImpl implements MockHostAdapter {
       if (n === undefined) return null;
       return Array.from({ length: n }, (_, i) => `item-${i + 1}`);
     }
+    // The mount root itself lists as the top of the drive (the media subdir, or
+    // the media folders directly when mediaSubdir is empty). This makes the
+    // status/restore "mount target readable" (EIO) probe see a live mount as
+    // readable — and a stale mount (mountedActive() false, above) as null.
+    if (hostPath === this.s.mountPoint) {
+      const sub = this.s.mediaSubdir.trim();
+      return sub === '' ? Object.keys(this.state.deviceFolders) : [sub.split('/')[0]!];
+    }
     return null;
   }
 
@@ -289,6 +309,13 @@ class MockHostAdapterImpl implements MockHostAdapter {
         const target = argv[argv.length - 1] ?? '';
         return this.state.mounts.some((m) => m.target === target) ? ok() : fail(1);
       }
+      case 'umbreld':
+        // `umbreld client apps.restart.mutate --appId=...`
+        if (argv[1] === 'client') {
+          this.doRecreate();
+          return ok('recreated via umbreld client');
+        }
+        return ok();
       case 'umbreld-client':
         this.doRecreate();
         return ok('recreated via umbreld-client');

@@ -41,7 +41,11 @@ update-persistent hook for exactly that.
    `umbrel-custom-pre-start.service` unit, 5-minute timeout, must be executable). Because it lives on the
    persistent partition, it survives OS updates the way `/etc/fstab` never could. The app manages a single
    marked block inside this file (`# BEGIN drive-remount-for-plex` / `# END`) that mounts the drive by
-   filesystem UUID - foreign content in the file is always preserved, never overwritten.
+   filesystem UUID - foreign content in the file is always preserved, never overwritten. The hook waits up
+   to ~30 seconds for the drive to enumerate under `/dev/disk/by-uuid` (USB udev settle), then makes one
+   best-effort mount attempt (`mount ... || true`); it never blocks or fails boot, and if the drive still
+   isn't up by then, the app's own monitor (below) picks up the still-unmounted drive on one of its first
+   checks after the container starts and mounts it then.
 2. **Compose patch** (`<UMBREL_ROOT>/app-data/<plexAppId>/docker-compose.yml`) - the app inserts one volume
    line into Plex's *installed* compose file, not the pristine store copy. This works, where an override
    wouldn't, because umbreld's `patchComposeFile()` re-serializes and force-injects `container_name` into
@@ -80,9 +84,11 @@ contained, disposable Docker daemon - not the host's own). Granting an app this 
 explicitly against official Umbrel App Store submission policy. **This is why this app is, and will only
 ever be, distributed through this personal community app store** - never submitted to Umbrel's official
 store. Install it only if you're comfortable with a container that can read/write host files and control
-the host's Docker daemon; every host-file mutation is backed up first (`/data/backups`, last 20 kept per
-file) and logged to the activity feed, `/etc/fstab` is never touched, and no other host files outside the
-boot hook and Plex's own compose file are ever written.
+the host's Docker daemon; every host-file mutation is backed up first, to `/data/backups` inside the
+container - which is `${UMBREL_ROOT}/app-data/hmlebtc-drive-remount-for-plex/data/backups` on the host,
+since `/data` is just this app's bind-mounted persistent storage - keeping the newest 20 backups per file,
+and every mutation is logged to the activity feed. `/etc/fstab` is never touched, and no other host files
+outside the boot hook and Plex's own compose file are ever written.
 
 ## Install on Umbrel
 
@@ -133,8 +139,8 @@ env vars in `docker-compose.yml` only *seed* `settings.json` the first time the 
 | Auto-heal enabled | `autoHeal.enabled` | `DRP_AUTOHEAL_ENABLED` | `true` |
 | Auto-heal check interval (s) | `autoHeal.intervalSec` | `DRP_AUTOHEAL_INTERVAL_SECONDS` | `30` (clamped 10-3600) |
 | Auto-heal cooldown (s) | `autoHeal.cooldownSec` | `DRP_AUTOHEAL_COOLDOWN_SECONDS` | `300` (clamped 60-86400) |
-| Max consecutive failures before suspend | `autoHeal.maxConsecutiveFailures` | *(not env-seeded)* | `3` |
-| Consecutive broken checks required (debounce) | `autoHeal.requireConsecutiveBroken` | *(not env-seeded)* | `2` |
+| Max consecutive failures before suspend | `autoHeal.maxConsecutiveFailures` | `DRP_AUTOHEAL_MAX_CONSECUTIVE_FAILURES` | `3` |
+| Consecutive broken checks required (debounce) | `autoHeal.requireConsecutiveBroken` | `DRP_AUTOHEAL_REQUIRE_CONSECUTIVE_BROKEN` | `2` |
 
 `DRP_HTTP_PORT` (default `3012`) and `DRP_DATA_DIR` (default `/data`) are process-level env vars, read at
 startup only - they're not part of `settings.json` and aren't editable from the dashboard.

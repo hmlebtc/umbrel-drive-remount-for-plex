@@ -110,3 +110,105 @@ services:
     volumes:
       - \${APP_DATA_DIR}/data:/data
 `;
+
+// ---------------------------------------------------------------------------
+// Corruption/idempotence regression fixtures (composePatch scanner rework).
+// ---------------------------------------------------------------------------
+
+// (a) A trailing #-comment on the `volumes:` key with block children below.
+// This is BLOCK style, NOT an inline flow array — the `volumes:` line must
+// never be rewritten into `volumes: [# bind mounts, ...]`.
+export const PLEX_COMPOSE_TRAILING_COMMENT_VOLUMES = `version: "3.7"
+
+services:
+  server:
+    image: umbrel/plex:1.32.8
+    container_name: plex_server_1
+    network_mode: host
+    volumes:  # bind mounts
+      - \${APP_DATA_DIR}/data/config:/config
+      - \${UMBREL_ROOT}/home/Downloads:/downloads
+    environment:
+      TZ: UTC
+`;
+
+// (b) CRLF line endings, ALREADY patched. Idempotence must hold byte-for-byte:
+// no duplicate insertion, no mixed EOL.
+export const PLEX_COMPOSE_CRLF_ALREADY_PATCHED =
+  'version: "3.7"\r\n' +
+  '\r\n' +
+  'services:\r\n' +
+  '  server:\r\n' +
+  '    image: umbrel/plex:1.32.8\r\n' +
+  '    container_name: plex_server_1\r\n' +
+  '    volumes:\r\n' +
+  '      - ${APP_DATA_DIR}/data/config:/config\r\n' +
+  '      - ' + HOST_MEDIA_PATH + ':' + CONTAINER_MEDIA_PATH + '\r\n' +
+  '      - ${UMBREL_ROOT}/home/Downloads:/downloads\r\n' +
+  '    environment:\r\n' +
+  '      TZ: UTC\r\n';
+
+// (b2) CRLF, NOT yet patched — the insert must use CRLF and be idempotent.
+export const PLEX_COMPOSE_CRLF_BASIC =
+  'version: "3.7"\r\n' +
+  '\r\n' +
+  'services:\r\n' +
+  '  server:\r\n' +
+  '    image: umbrel/plex:1.32.8\r\n' +
+  '    container_name: plex_server_1\r\n' +
+  '    volumes:\r\n' +
+  '      - ${APP_DATA_DIR}/data/config:/config\r\n' +
+  '      - ${UMBREL_ROOT}/home/Downloads:/downloads\r\n' +
+  '    environment:\r\n' +
+  '      TZ: UTC\r\n';
+
+// (c) Blank + comment-only lines interleaved between volume items, with the
+// target already present AFTER a comment. Collection must skip the blank/comment
+// and still see the target -> already-present, no duplicate insertion.
+export const PLEX_COMPOSE_COMMENT_INTERLEAVED_ALREADY_PATCHED = `version: "3.7"
+
+services:
+  server:
+    image: umbrel/plex:1.32.8
+    container_name: plex_server_1
+    volumes:
+      - \${APP_DATA_DIR}/data/config:/config
+
+      # media library bind (managed by drive-remount-for-plex)
+      - ${HOST_MEDIA_PATH}:${CONTAINER_MEDIA_PATH}
+      - \${UMBREL_ROOT}/home/Downloads:/downloads
+    environment:
+      TZ: UTC
+`;
+
+// (c2) Same interleaving but NOT patched — a single clean insert after the LAST
+// item, no duplicate.
+export const PLEX_COMPOSE_COMMENT_INTERLEAVED_UNPATCHED = `version: "3.7"
+
+services:
+  server:
+    image: umbrel/plex:1.32.8
+    container_name: plex_server_1
+    volumes:
+      - \${APP_DATA_DIR}/data/config:/config
+
+      # downloads bind
+      - \${UMBREL_ROOT}/home/Downloads:/downloads
+    environment:
+      TZ: UTC
+`;
+
+// (d) Tab-indented compose. The patcher must EITHER cleanly insert OR return
+// problems[] — it must never corrupt the file.
+export const PLEX_COMPOSE_TABS =
+  'version: "3.7"\n' +
+  '\n' +
+  'services:\n' +
+  '\tserver:\n' +
+  '\t\timage: umbrel/plex:1.32.8\n' +
+  '\t\tcontainer_name: plex_server_1\n' +
+  '\t\tvolumes:\n' +
+  '\t\t\t- ${APP_DATA_DIR}/data/config:/config\n' +
+  '\t\t\t- ${UMBREL_ROOT}/home/Downloads:/downloads\n' +
+  '\t\tenvironment:\n' +
+  '\t\t\tTZ: UTC\n';

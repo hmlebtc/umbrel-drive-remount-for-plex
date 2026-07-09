@@ -37,8 +37,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { decide } from "./monitor.js";
-import type { AppStatus, MonitorHistory, Settings } from "./types.js";
+import { bookRestoreOutcome, decide, type RestoreBookkeeping } from "./monitor.js";
+import type { AppStatus, MonitorHistory, RestoreJob, Settings } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -284,4 +284,91 @@ test("decide: repeated drive presence (no transition) leaves a suspension in eff
   });
   const result = decide(status, settings, history);
   assertAction(result, "none");
+});
+
+// ---------------------------------------------------------------------------
+// bookRestoreOutcome (fix #8): only a FINISHED job updates counters. A job
+// still running at the wait deadline must update NOTHING (previously it was
+// mis-booked as a success, resetting the failure counter and letting a slow
+// failing restore evade suspension).
+// ---------------------------------------------------------------------------
+
+function bk(overrides: Partial<RestoreBookkeeping> = {}): RestoreBookkeeping {
+  return { consecutiveFailures: 0, consecutiveBroken: 0, suspended: false, jobRunning: false, ...overrides };
+}
+
+function job(overrides: Partial<RestoreJob> = {}): RestoreJob {
+  return {
+    running: false,
+    jobId: "j1",
+    trigger: "auto",
+    startedAt: "2026-07-08T12:00:00.000Z",
+    finishedAt: "2026-07-08T12:00:10.000Z",
+    steps: [{ name: "preflight", state: "ok", log: [] }],
+    result: "ok",
+    ...overrides,
+  } as RestoreJob;
+}
+
+test("bookRestoreOutcome: finished + no failed step -> success resets counters", () => {
+  const out = bookRestoreOutcome(bk({ consecutiveFailures: 2, consecutiveBroken: 3 }), {
+    isRunning: false,
+    job: job(),
+    maxConsecutiveFailures: 3,
+  });
+  assert.deepEqual(out, { consecutiveFailures: 0, consecutiveBroken: 0, suspended: false, jobRunning: false });
+});
+
+test("bookRestoreOutcome: finished + a failed step -> increments failures", () => {
+  const out = bookRestoreOutcome(bk({ consecutiveFailures: 1 }), {
+    isRunning: false,
+    job: job({ steps: [{ name: "mount", state: "failed", log: [] }] }),
+    maxConsecutiveFailures: 3,
+  });
+  assert.equal(out.consecutiveFailures, 2);
+  assert.equal(out.suspended, false);
+  assert.equal(out.jobRunning, false);
+});
+
+test("bookRestoreOutcome: finished failure reaching the max -> suspended", () => {
+  const out = bookRestoreOutcome(bk({ consecutiveFailures: 2 }), {
+    isRunning: false,
+    job: job({ steps: [{ name: "mount", state: "failed", log: [] }] }),
+    maxConsecutiveFailures: 3,
+  });
+  assert.equal(out.consecutiveFailures, 3);
+  assert.equal(out.suspended, true);
+});
+
+test("bookRestoreOutcome: STILL RUNNING at deadline -> updates NOTHING but jobRunning stays true", () => {
+  // The regression: a running job whose steps are all still pending has no
+  // failed step, so the old code booked it as a success and reset the counter.
+  const prev = bk({ consecutiveFailures: 2, consecutiveBroken: 4, suspended: false });
+  const running = job({ running: true, finishedAt: null, steps: [{ name: "mount", state: "running", log: [] }], result: null });
+  const out = bookRestoreOutcome(prev, { isRunning: true, job: running, maxConsecutiveFailures: 3 });
+  assert.equal(out.consecutiveFailures, 2, "must NOT reset the failure counter");
+  assert.equal(out.consecutiveBroken, 4, "must NOT reset the broken counter");
+  assert.equal(out.suspended, false);
+  assert.equal(out.jobRunning, true, "jobRunning stays true so the next tick guards");
+});
+
+test("bookRestoreOutcome: not-yet-finished (finishedAt null even if !isRunning) -> updates nothing", () => {
+  const prev = bk({ consecutiveFailures: 1 });
+  const out = bookRestoreOutcome(prev, {
+    isRunning: false,
+    job: job({ finishedAt: null }),
+    maxConsecutiveFailures: 3,
+  });
+  assert.equal(out.consecutiveFailures, 1);
+  assert.equal(out.jobRunning, true);
+});
+
+test("bookRestoreOutcome: null job -> updates nothing, jobRunning stays true", () => {
+  const out = bookRestoreOutcome(bk({ consecutiveFailures: 2 }), {
+    isRunning: false,
+    job: null,
+    maxConsecutiveFailures: 3,
+  });
+  assert.equal(out.consecutiveFailures, 2);
+  assert.equal(out.jobRunning, true);
 });

@@ -113,6 +113,7 @@ function summarizeJob(job: RestoreJob | null): RestoreSummary | null {
     trigger: job.trigger ?? '',
     startedAt: job.startedAt ?? '',
     finishedAt: job.finishedAt,
+    at: job.finishedAt ?? job.startedAt ?? null,
     ok: job.result !== null && !job.steps.some((s) => s.state === 'failed'),
     result: job.result,
   };

@@ -35,13 +35,39 @@ export function isHealthy(s: AppStatus): boolean {
   );
 }
 
-/** A mount is stale if its backing device no longer matches the live by-uuid device. */
-function computeStale(mounted: boolean, present: boolean, device: string | null, source: string): boolean {
+/**
+ * A mount is stale (spec sections 2, 7) when, being mounted, any of:
+ *   - the drive's by-uuid symlink is gone entirely (drive detached), or
+ *   - the mount target is unreadable via the adapter (EIO — device yanked out
+ *     from under a live mount; see {@link probeMountReadable}), or
+ *   - the backing device no longer matches the live by-uuid device
+ *     (re-enumerated after a replug).
+ *
+ * This ONE helper is shared by status.ts (probeStatus) and restore.ts
+ * (ensureMount) so both agree on exactly what "stale" means.
+ */
+export function computeStale(
+  mounted: boolean,
+  present: boolean,
+  device: string | null,
+  source: string,
+  targetReadable: boolean,
+): boolean {
   if (!mounted) return false;
-  // Mounted but the drive's by-uuid symlink is gone entirely -> definitely stale.
   if (!present) return true;
+  if (!targetReadable) return true;
   if (device === null || source === '') return false;
   return source !== device;
+}
+
+/**
+ * EIO probe: is the mount target readable via the adapter? A live, healthy
+ * mount lists its root directory (even an empty mount returns `[]`); a mount
+ * whose backing device has gone away errors and lists as `null`. Only meaningful
+ * when the target is actually mounted.
+ */
+export async function probeMountReadable(adapter: HostAdapter, mountPoint: string): Promise<boolean> {
+  return (await adapter.listDir(mountPoint)) !== null;
 }
 
 async function detectFstabEntry(adapter: HostAdapter, settings: Settings): Promise<boolean> {
@@ -72,7 +98,8 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
   const source = entry?.source ?? '';
   const rw = entry ? entry.options.includes('rw') && !entry.options.includes('ro') : false;
   const mountFsType = entry?.fsType ?? settings.fsType;
-  const stale = computeStale(mounted, present, device, source);
+  const targetReadable = mounted ? await probeMountReadable(adapter, settings.mountPoint) : true;
+  const stale = computeStale(mounted, present, device, source, targetReadable);
 
   // --- Boot hook ------------------------------------------------------------
   const hookP = hookPath(settings);
@@ -112,11 +139,17 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
   }
 
   // --- Plex container -------------------------------------------------------
+  // A bind counts only when BOTH ends match: the host source must be our media
+  // path AND the container destination must be containerMediaPath (a stale
+  // source pointing elsewhere means the media is not actually visible).
   const inspect = await adapter.inspectPlex(settings.plexAppId);
+  const wantBindSource = hostMediaPath(settings);
   const bindOk =
     inspect.found &&
     inspect.state === 'running' &&
-    inspect.binds.some((b) => b.destination === settings.containerMediaPath);
+    inspect.binds.some(
+      (b) => b.source === wantBindSource && b.destination === settings.containerMediaPath,
+    );
 
   // --- Media folders --------------------------------------------------------
   const mediaRoot = hostMediaPath(settings);

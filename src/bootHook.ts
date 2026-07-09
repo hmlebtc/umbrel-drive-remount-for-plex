@@ -14,8 +14,13 @@
  *
  * The mount command deliberately ends in `|| true` so a failed mount can never
  * block boot. Settings validation (settings.ts) guarantees uuid/mountPoint/
- * fsType contain no shell metacharacters, so the unquoted templating below is
- * safe.
+ * fsType contain no shell metacharacters; we ALSO single-quote every templated
+ * value below as defense in depth (quoting is always safe because validation
+ * bans quotes). The block runs right after local-fs.target — before udev has
+ * necessarily settled the USB device — so it waits (bounded, ~30s) for the
+ * by-uuid symlink to appear before mounting. Nothing in the block may fail the
+ * hook (5-minute boot timeout): the wait loop is bounded and the mount is
+ * `|| true`.
  */
 
 export interface HookOptions {
@@ -36,11 +41,14 @@ const SHEBANG = '#!/bin/sh';
 
 /** The managed block lines, from BEGIN marker to END marker (inclusive). */
 function renderBlockLines(opts: HookOptions): string[] {
+  const dev = `/dev/disk/by-uuid/${opts.uuid}`;
   return [
     BEGIN_MARKER,
-    `mkdir -p ${opts.mountPoint}`,
-    `if ! mountpoint -q ${opts.mountPoint}; then`,
-    `  mount -t ${opts.fsType} /dev/disk/by-uuid/${opts.uuid} ${opts.mountPoint} || true`,
+    'i=0',
+    `while [ ! -e '${dev}' ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done`,
+    `mkdir -p '${opts.mountPoint}'`,
+    `if ! mountpoint -q '${opts.mountPoint}'; then`,
+    `  mount -t '${opts.fsType}' '${dev}' '${opts.mountPoint}' || true`,
     'fi',
     END_MARKER,
   ];

@@ -18,10 +18,17 @@ import {
   HOST_MEDIA_PATH,
   PLEX_COMPOSE_BASIC,
   PLEX_COMPOSE_BASIC_ALREADY_PATCHED,
+  PLEX_COMPOSE_COMMENT_INTERLEAVED_ALREADY_PATCHED,
+  PLEX_COMPOSE_COMMENT_INTERLEAVED_UNPATCHED,
+  PLEX_COMPOSE_CRLF_ALREADY_PATCHED,
+  PLEX_COMPOSE_CRLF_BASIC,
   PLEX_COMPOSE_NO_SERVER_SERVICE,
   PLEX_COMPOSE_NO_VOLUMES_KEY,
   PLEX_COMPOSE_RESERIALIZED,
   PLEX_COMPOSE_RESERIALIZED_ALREADY_PATCHED,
+  PLEX_COMPOSE_TABS,
+  PLEX_COMPOSE_TRAILING_COMMENT_VOLUMES,
+  TARGET_VOLUME_LINE,
 } from "./fixtures/composeFixtures.js";
 
 const OPTS = { hostPath: HOST_MEDIA_PATH, containerPath: CONTAINER_MEDIA_PATH };
@@ -174,5 +181,120 @@ test("never reorders or removes existing lines (reserialized fixture)", () => {
   const newLines = new Set(result.text.split("\n"));
   for (const line of origLines) {
     assert.ok(newLines.has(line), `original line lost or mutated: ${JSON.stringify(line)}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Regression (a): trailing #-comment on the `volumes:` key is NOT inline flow.
+// Old bug: rewrote the key into `volumes: [# bind mounts, /mnt/...]`, dangling
+// the block items below it (invalid YAML — Plex could not start).
+// ---------------------------------------------------------------------------
+
+function countTargetItems(text: string): number {
+  return text.split("\n").filter((l) => {
+    const stripped = l.trim().replace(/^-\s*/, "").replace(/^"|"$/g, "");
+    return stripped === TARGET_VOLUME_LINE;
+  }).length;
+}
+
+test("trailing comment on volumes: key -> block insert, key line never rewritten", () => {
+  const result = ensureVolumeLine(PLEX_COMPOSE_TRAILING_COMMENT_VOLUMES, OPTS);
+  assert.equal(result.changed, true);
+  assert.equal(result.alreadyPresent, false);
+  assert.deepEqual(result.problems, []);
+
+  // The `volumes:` line is preserved verbatim, comment and all.
+  assert.ok(
+    result.text.includes("    volumes:  # bind mounts"),
+    "the commented volumes: key line must be preserved untouched",
+  );
+  // It must NOT have been mangled into an inline flow array.
+  assert.ok(!result.text.includes("volumes: ["), "must not rewrite into an inline flow array");
+  assert.ok(!result.text.includes("# bind mounts,"), "comment must not be swept into an array element");
+
+  // The new item is inserted as a block sibling at the 6-space indentation,
+  // after the last existing item.
+  assert.ok(result.text.includes("\n      - " + TARGET_VOLUME_LINE));
+  assert.equal(countTargetItems(result.text), 1, "exactly one media bind item");
+  assertOriginalLinesPreservedInOrder(PLEX_COMPOSE_TRAILING_COMMENT_VOLUMES, result.text);
+});
+
+// ---------------------------------------------------------------------------
+// Regression (b): CRLF files. Idempotence must hold byte-for-byte; a fresh
+// insert must use CRLF, not an LF line jammed in as the first item.
+// ---------------------------------------------------------------------------
+
+test("CRLF already-patched compose -> alreadyPresent, no change, byte-identical", () => {
+  const result = ensureVolumeLine(PLEX_COMPOSE_CRLF_ALREADY_PATCHED, OPTS);
+  assert.equal(result.alreadyPresent, true);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.text, PLEX_COMPOSE_CRLF_ALREADY_PATCHED, "output must be byte-identical on CRLF");
+});
+
+test("CRLF unpatched compose -> inserts with CRLF, and is idempotent", () => {
+  const first = ensureVolumeLine(PLEX_COMPOSE_CRLF_BASIC, OPTS);
+  assert.equal(first.changed, true);
+  assert.equal(first.alreadyPresent, false);
+  // Inserted line carries CRLF (not a bare LF), and it is not the first item.
+  assert.ok(
+    first.text.includes("      - " + TARGET_VOLUME_LINE + "\r\n"),
+    "inserted line must use CRLF",
+  );
+  assert.ok(!first.text.includes("\r\r"), "no doubled CR");
+  assert.ok(!/[^\r]\n/.test(first.text), "no lone LF (mixed EOL) introduced");
+  assert.equal(countTargetItems(first.text), 1);
+
+  const second = ensureVolumeLine(first.text, OPTS);
+  assert.equal(second.alreadyPresent, true);
+  assert.equal(second.changed, false);
+  assert.equal(second.text, first.text, "CRLF patch must be idempotent");
+});
+
+// ---------------------------------------------------------------------------
+// Regression (c): blank / comment-only lines between volume items.
+// Old bug: collection stopped at the first blank/comment, missing a target
+// listed after it, and inserted a duplicate above the comment.
+// ---------------------------------------------------------------------------
+
+test("comment/blank interleaved, target already present after a comment -> no change", () => {
+  const result = ensureVolumeLine(PLEX_COMPOSE_COMMENT_INTERLEAVED_ALREADY_PATCHED, OPTS);
+  assert.equal(result.alreadyPresent, true);
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.text, PLEX_COMPOSE_COMMENT_INTERLEAVED_ALREADY_PATCHED);
+  assert.equal(countTargetItems(result.text), 1, "must not duplicate the existing bind");
+});
+
+test("comment/blank interleaved, not patched -> single clean insert after last item", () => {
+  const result = ensureVolumeLine(PLEX_COMPOSE_COMMENT_INTERLEAVED_UNPATCHED, OPTS);
+  assert.equal(result.changed, true);
+  assert.equal(result.alreadyPresent, false);
+  assert.deepEqual(result.problems, []);
+  assert.equal(countTargetItems(result.text), 1);
+  // Inserted after the downloads item (the last real item), not above the comment.
+  const lines = result.text.split("\n");
+  const downloadsIdx = lines.findIndex((l) => l.includes("home/Downloads:/downloads"));
+  const targetIdx = lines.findIndex((l) => l.trim().replace(/^-\s*/, "") === TARGET_VOLUME_LINE);
+  assert.ok(downloadsIdx >= 0 && targetIdx === downloadsIdx + 1, "target must be inserted after the last item");
+  assertOriginalLinesPreservedInOrder(PLEX_COMPOSE_COMMENT_INTERLEAVED_UNPATCHED, result.text);
+});
+
+// ---------------------------------------------------------------------------
+// Regression (d): tab-indented compose -> clean insert OR problems[], never
+// corruption.
+// ---------------------------------------------------------------------------
+
+test("tab-indented compose -> clean insert or problems[], never corruption", () => {
+  const result = ensureVolumeLine(PLEX_COMPOSE_TABS, OPTS);
+  if (result.changed) {
+    assert.equal(result.alreadyPresent, false);
+    assert.deepEqual(result.problems, []);
+    assert.equal(countTargetItems(result.text), 1);
+    assertOriginalLinesPreservedInOrder(PLEX_COMPOSE_TABS, result.text);
+  } else {
+    assert.ok(result.problems.length > 0, "if not inserted, a problem must be reported");
+    assert.equal(result.text, PLEX_COMPOSE_TABS, "unchanged text -> no corruption");
+    assert.equal(result.alreadyPresent, false);
   }
 });

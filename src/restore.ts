@@ -20,13 +20,14 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { backupFile } from './backups.js';
 import { ensureHookBlock } from './bootHook.js';
 import { ensureVolumeLine } from './composePatch.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
 import { findMount, parseProcMounts } from './mounts.js';
 import { appDataDir, byUuidPath, composePath, hookPath, hostMediaPath } from './paths.js';
-import { isHealthy, probeStatus } from './status.js';
+import { computeStale, isHealthy, probeMountReadable, probeStatus } from './status.js';
 import type { AppStatus, JobStep, RestoreJob, RestoreTrigger, Settings, StepName } from './types.js';
 
 const STEP_ORDER: StepName[] = ['preflight', 'bootHook', 'mount', 'composePatch', 'recreate', 'verify'];
@@ -60,7 +61,19 @@ class RestoreRunnerImpl implements RestoreRunner {
     private readonly adapter: HostAdapter,
     private readonly getSettings: () => Settings,
     private readonly events?: EventLog,
+    private readonly dataDir?: string,
   ) {}
+
+  /**
+   * Snapshot a host file's CURRENT content to ${dataDir}/backups before we
+   * overwrite it, and log the backup path into the step. No-op (no backup) when
+   * no data dir is configured or the file did not previously exist.
+   */
+  private backup(step: JobStep, sourcePath: string, currentContent: string | null): void {
+    if (this.dataDir === undefined) return;
+    const path = backupFile(this.dataDir, sourcePath, currentContent);
+    if (path !== null) this.logLine(step, `backed up previous ${sourcePath} to ${path}`);
+  }
 
   isRunning(): boolean {
     return this.job?.running === true;
@@ -150,6 +163,7 @@ class RestoreRunnerImpl implements RestoreRunner {
         fsType: settings.fsType,
       });
       if (hookRes.changed) {
+        this.backup(hook, hp, existingHook);
         await this.adapter.writeFileAtomic(hp, hookRes.text, 0o755);
         this.logLine(hook, `installed boot hook at ${hp}${hookRes.foreignContentPreserved ? ' (preserved existing content)' : ''}`);
         hook.state = 'ok';
@@ -191,6 +205,7 @@ class RestoreRunnerImpl implements RestoreRunner {
         return;
       }
       if (patchRes.changed) {
+        this.backup(patch, cp, composeText);
         await this.adapter.writeFileAtomic(cp, patchRes.text);
         composeChanged = true;
         this.logLine(patch, `patched media bind into ${cp}`);
@@ -204,10 +219,13 @@ class RestoreRunnerImpl implements RestoreRunner {
       const rec = this.stepOf(job, 'recreate');
       rec.state = 'running';
       const inspect = await this.adapter.inspectPlex(settings.plexAppId);
+      const wantSource = hostMediaPath(settings);
       const bindPresent =
         inspect.found &&
         inspect.state === 'running' &&
-        inspect.binds.some((b) => b.destination === settings.containerMediaPath);
+        inspect.binds.some(
+          (b) => b.source === wantSource && b.destination === settings.containerMediaPath,
+        );
       const needRecreate =
         trigger === 'restart-plex' ||
         composeChanged ||
@@ -280,7 +298,11 @@ class RestoreRunnerImpl implements RestoreRunner {
     const device = await this.adapter.realpath(dev);
     const entry = findMount(parseProcMounts(await this.adapter.readProcMounts()), settings.mountPoint);
     const mounted = entry !== null;
-    const stale = mounted && device !== null && entry!.source !== device;
+    // Stale detection uses the SAME helper + EIO probe as status.ts so both
+    // agree: stale when the by-uuid device is gone, the target is unreadable
+    // (EIO), or the backing device no longer matches the live one.
+    const targetReadable = mounted ? await probeMountReadable(this.adapter, settings.mountPoint) : true;
+    const stale = computeStale(mounted, device !== null, device, entry?.source ?? '', targetReadable);
 
     if (mounted && !stale) {
       this.logLine(step, `already mounted at ${settings.mountPoint} (${entry!.source})`);
@@ -311,7 +333,14 @@ class RestoreRunnerImpl implements RestoreRunner {
     return true;
   }
 
-  /** Recreate Plex: umbreld-native first, docker compose fallback. */
+  /**
+   * Recreate Plex. The umbreld CLI form is unverified across umbrelOS versions,
+   * so we try the known candidates IN ORDER, logging each attempt, and fall back
+   * to the user's proven direct `docker compose` invocation last:
+   *   1. `umbreld client apps.restart.mutate --appId=<id>`
+   *   2. `umbreld-client apps.restart.mutate --appId=<id>`
+   *   3. `docker compose -f <compose> up -d --force-recreate` (with app env)
+   */
   private async recreatePlex(step: JobStep, settings: Settings): Promise<boolean> {
     const hostname = await this.adapter.hostname();
     const env: Record<string, string> = {
@@ -321,17 +350,21 @@ class RestoreRunnerImpl implements RestoreRunner {
       DEVICE_HOSTNAME: hostname,
     };
 
-    const viaUmbreld = await this.adapter.exec([
-      'umbreld-client',
-      'apps.restart.mutate',
-      `--appId=${settings.plexAppId}`,
-    ]);
-    if (viaUmbreld.code === 0) {
-      this.logLine(step, 'recreated via umbreld-client');
-      return true;
+    const umbreldAttempts: Array<{ label: string; argv: string[] }> = [
+      { label: 'umbreld client', argv: ['umbreld', 'client', 'apps.restart.mutate', `--appId=${settings.plexAppId}`] },
+      { label: 'umbreld-client', argv: ['umbreld-client', 'apps.restart.mutate', `--appId=${settings.plexAppId}`] },
+    ];
+    for (const attempt of umbreldAttempts) {
+      this.logLine(step, `attempting Plex restart via \`${attempt.label}\``);
+      const r = await this.adapter.exec(attempt.argv);
+      if (r.code === 0) {
+        this.logLine(step, `recreated via ${attempt.label}`);
+        return true;
+      }
+      this.logLine(step, `${attempt.label} unavailable (code ${r.code}); trying next`);
     }
-    this.logLine(step, `umbreld-client unavailable (code ${viaUmbreld.code}); falling back to docker compose`);
 
+    this.logLine(step, 'falling back to direct docker compose recreate');
     const compose = await this.adapter.exec(
       ['docker', 'compose', '-p', settings.plexAppId, '-f', composePath(settings), 'up', '-d', '--force-recreate', '--no-deps', 'server'],
       { env },
@@ -349,6 +382,7 @@ export function createRestoreRunner(
   adapter: HostAdapter,
   getSettings: () => Settings,
   events?: EventLog,
+  dataDir?: string,
 ): RestoreRunner {
-  return new RestoreRunnerImpl(adapter, getSettings, events);
+  return new RestoreRunnerImpl(adapter, getSettings, events, dataDir);
 }

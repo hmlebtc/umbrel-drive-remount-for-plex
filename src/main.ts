@@ -26,7 +26,7 @@ function main(): void {
     ? createMockAdapter((process.env.MOCK_SCENARIO as MockScenario) || 'healthy')
     : createRealAdapter();
 
-  const restore = createRestoreRunner(adapter, () => settings.get(), events);
+  const restore = createRestoreRunner(adapter, () => settings.get(), events, dataDir);
   const monitor = new Monitor({ adapter, getSettings: () => settings.get(), restore, events });
 
   const ctx: AppContext = {

@@ -65,15 +65,41 @@ test("create-from-null: uuid/mountPoint/fsType are templated correctly (non-defa
   const result = ensureHookBlock(null, { uuid, mountPoint, fsType });
 
   assert.equal(result.changed, true);
-  assert.ok(result.text.includes(`mkdir -p ${mountPoint}`));
-  assert.ok(result.text.includes(`mountpoint -q ${mountPoint}`));
+  assert.ok(result.text.includes(`mkdir -p '${mountPoint}'`));
+  assert.ok(result.text.includes(`mountpoint -q '${mountPoint}'`));
   assert.ok(
-    result.text.includes(`mount -t ${fsType} /dev/disk/by-uuid/${uuid} ${mountPoint} || true`),
+    result.text.includes(`mount -t '${fsType}' '/dev/disk/by-uuid/${uuid}' '${mountPoint}' || true`),
   );
   // The stale defaults must NOT leak through.
   assert.ok(!result.text.includes(HOOK_MOUNT_POINT));
   assert.ok(!result.text.includes(HOOK_UUID));
   assert.ok(!result.text.includes("ext4"));
+});
+
+// ---------------------------------------------------------------------------
+// Canonical block: single-quoted values + bounded USB-settle wait loop.
+// ---------------------------------------------------------------------------
+
+test("create-from-null: waits (bounded) for the by-uuid device before mounting", () => {
+  const result = ensureHookBlock(null, {
+    uuid: HOOK_UUID,
+    mountPoint: HOOK_MOUNT_POINT,
+    fsType: HOOK_FSTYPE,
+  });
+  // A bounded wait loop guards against the USB device not being udev-settled
+  // yet when the pre-start hook runs (right after local-fs.target).
+  assert.ok(result.text.includes("i=0"), "expected the wait-loop counter to be initialised");
+  assert.ok(
+    result.text.includes(
+      `while [ ! -e '/dev/disk/by-uuid/${HOOK_UUID}' ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done`,
+    ),
+    "expected a bounded (30s) wait for the by-uuid symlink before mounting",
+  );
+  // Values are single-quoted (defense in depth); the wait precedes the mkdir/mount.
+  const waitIdx = result.text.indexOf("while [ ! -e");
+  const mkdirIdx = result.text.indexOf("mkdir -p '");
+  const mountIdx = result.text.indexOf("mount -t '");
+  assert.ok(waitIdx >= 0 && mkdirIdx > waitIdx && mountIdx > mkdirIdx, "wait loop must come before mkdir/mount");
 });
 
 // ---------------------------------------------------------------------------
@@ -140,10 +166,10 @@ test("existing with markers: block content is replaced, foreign lines outside un
   assert.ok(!result.text.includes("/mnt/OLDPATH"));
   assert.ok(!result.text.includes("00000000-0000-0000-0000-000000000000"));
   assert.ok(!result.text.includes("vfat"));
-  assert.ok(result.text.includes(`mkdir -p ${HOOK_MOUNT_POINT}`));
+  assert.ok(result.text.includes(`mkdir -p '${HOOK_MOUNT_POINT}'`));
   assert.ok(
     result.text.includes(
-      `mount -t ${HOOK_FSTYPE} /dev/disk/by-uuid/${HOOK_UUID} ${HOOK_MOUNT_POINT} || true`,
+      `mount -t '${HOOK_FSTYPE}' '/dev/disk/by-uuid/${HOOK_UUID}' '${HOOK_MOUNT_POINT}' || true`,
     ),
   );
 });

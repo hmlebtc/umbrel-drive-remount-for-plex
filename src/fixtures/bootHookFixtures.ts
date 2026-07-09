@@ -4,14 +4,17 @@ export const HOOK_UUID = "555bf6f0-ae17-4137-adec-e91818854f1c";
 export const HOOK_MOUNT_POINT = "/mnt/wdexternal";
 export const HOOK_FSTYPE = "ext4";
 
-// Verbatim from spec section 6(a) — the exact expected output when creating
-// the hook from scratch with the spec's example settings.
+// The exact expected output when creating the hook from scratch with the spec's
+// example settings. Canonical managed block: values single-quoted (defense in
+// depth) and a bounded USB-settle wait loop before the mount.
 export const EXPECTED_HOOK_BLOCK_DEFAULT =
   "#!/bin/sh\n" +
   "# BEGIN drive-remount-for-plex (managed block - do not edit inside)\n" +
-  "mkdir -p /mnt/wdexternal\n" +
-  "if ! mountpoint -q /mnt/wdexternal; then\n" +
-  "  mount -t ext4 /dev/disk/by-uuid/555bf6f0-ae17-4137-adec-e91818854f1c /mnt/wdexternal || true\n" +
+  "i=0\n" +
+  "while [ ! -e '/dev/disk/by-uuid/555bf6f0-ae17-4137-adec-e91818854f1c' ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done\n" +
+  "mkdir -p '/mnt/wdexternal'\n" +
+  "if ! mountpoint -q '/mnt/wdexternal'; then\n" +
+  "  mount -t 'ext4' '/dev/disk/by-uuid/555bf6f0-ae17-4137-adec-e91818854f1c' '/mnt/wdexternal' || true\n" +
   "fi\n" +
   "# END drive-remount-for-plex";
 

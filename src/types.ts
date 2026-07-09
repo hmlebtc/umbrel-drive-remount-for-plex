@@ -113,6 +113,8 @@ export interface RestoreSummary {
   trigger: string;
   startedAt: string;
   finishedAt: string | null;
+  /** Spec section 9 lastRestore.at: finishedAt ?? startedAt (the "when"). */
+  at: string | null;
   ok: boolean;
   result: string | null;
 }

@@ -26,6 +26,7 @@ import type {
   AutoHealStatus,
   Decision,
   MonitorHistory,
+  RestoreJob,
   Settings,
 } from './types.js';
 import type { RestoreRunner } from './restore.js';
@@ -99,6 +100,42 @@ export function decide(status: AppStatus, settings: Settings, history: MonitorHi
 
   // 8. Heal.
   return { action: 'restore', reason: 'system unhealthy — auto-heal triggered' };
+}
+
+/** Failure/suspension counters the monitor advances after an auto-heal restore. */
+export interface RestoreBookkeeping {
+  consecutiveFailures: number;
+  consecutiveBroken: number;
+  suspended: boolean;
+  jobRunning: boolean;
+}
+
+/**
+ * Compute the counter bookkeeping AFTER an auto-heal restore has been waited on.
+ *
+ * CRITICAL (spec section 8): only a job that ACTUALLY FINISHED updates the
+ * success/failure counters. A job still running at the wait deadline
+ * (isRunning() true, or finishedAt not yet set) must update NOTHING except to
+ * keep jobRunning:true — otherwise a slow restore whose steps are still
+ * "pending" (no failed step) would be mis-booked as a success, reset the
+ * failure counter, and let a genuinely-failing slow restore evade suspension.
+ */
+export function bookRestoreOutcome(
+  prev: RestoreBookkeeping,
+  opts: { isRunning: boolean; job: RestoreJob | null; maxConsecutiveFailures: number },
+): RestoreBookkeeping {
+  const finished = !opts.isRunning && opts.job !== null && opts.job.finishedAt != null;
+  if (!finished) {
+    // Still running at the deadline: change nothing, keep guarding.
+    return { ...prev, jobRunning: true };
+  }
+  const failed = opts.job!.steps.some((s) => s.state === 'failed');
+  if (!failed) {
+    return { consecutiveFailures: 0, consecutiveBroken: 0, suspended: false, jobRunning: false };
+  }
+  const consecutiveFailures = prev.consecutiveFailures + 1;
+  const suspended = consecutiveFailures >= opts.maxConsecutiveFailures ? true : prev.suspended;
+  return { consecutiveFailures, consecutiveBroken: prev.consecutiveBroken, suspended, jobRunning: false };
 }
 
 export interface MonitorDeps {
@@ -234,21 +271,32 @@ export class Monitor {
       this.history.jobRunning = true;
 
       await this.waitForJob();
-      this.history.jobRunning = false;
-      const job = this.deps.restore.getJob();
-      const ok = job !== null && !job.steps.some((s) => s.state === 'failed');
-      if (ok) {
-        this.history.consecutiveFailures = 0;
-        this.history.consecutiveBroken = 0;
-      } else {
-        this.history.consecutiveFailures += 1;
-        if (this.history.consecutiveFailures >= settings.autoHeal.maxConsecutiveFailures) {
-          this.history.suspended = true;
-          this.deps.events?.warn(
-            'monitor',
-            `auto-heal suspended after ${this.history.consecutiveFailures} consecutive failures`,
-          );
-        }
+
+      // Only a finished job updates the counters; a job still running at the
+      // deadline updates NOTHING (jobRunning stays true so the next tick guards).
+      const wasSuspended = this.history.suspended;
+      const outcome = bookRestoreOutcome(
+        {
+          consecutiveFailures: this.history.consecutiveFailures,
+          consecutiveBroken: this.history.consecutiveBroken,
+          suspended: this.history.suspended,
+          jobRunning: this.history.jobRunning,
+        },
+        {
+          isRunning: this.deps.restore.isRunning(),
+          job: this.deps.restore.getJob(),
+          maxConsecutiveFailures: settings.autoHeal.maxConsecutiveFailures,
+        },
+      );
+      this.history.jobRunning = outcome.jobRunning;
+      this.history.consecutiveFailures = outcome.consecutiveFailures;
+      this.history.consecutiveBroken = outcome.consecutiveBroken;
+      this.history.suspended = outcome.suspended;
+      if (outcome.suspended && !wasSuspended) {
+        this.deps.events?.warn(
+          'monitor',
+          `auto-heal suspended after ${outcome.consecutiveFailures} consecutive failures`,
+        );
       }
     } finally {
       this.ticking = false;

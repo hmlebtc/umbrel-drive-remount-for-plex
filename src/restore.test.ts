@@ -46,6 +46,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createMockAdapter, type MockScenario } from "./mockAdapter.js";
 import { createRestoreRunner } from "./restore.js";
@@ -89,6 +92,11 @@ async function waitForJobDone(
 
 function stepState(job: Job, name: string): string | undefined {
   return job.steps.find((s) => s.name === name)?.state;
+}
+
+function stepLog(job: Job, name: string): string {
+  const step = job.steps.find((s) => s.name === name);
+  return (step?.log ?? []).map((l) => l.line).join("\n");
 }
 
 function runScenario(scenario: MockScenario, settings: Settings = testSettings()) {
@@ -211,4 +219,81 @@ test("restore: a second concurrent start() while a job is running is rejected", 
   const third = runner.start("manual");
   assert.equal(third.ok, true);
   await waitForJobDone(runner);
+});
+
+// ---------------------------------------------------------------------------
+// Fix #5: recreate tries `umbreld client` FIRST (before umbreld-client / docker).
+// ---------------------------------------------------------------------------
+
+test("restore: recreate attempts `umbreld client` first", async () => {
+  const { runner } = runScenario("bindMissing");
+  runner.start("manual");
+  const job = await waitForJobDone(runner);
+
+  assert.equal(stepState(job, "recreate"), "ok");
+  const log = stepLog(job, "recreate");
+  assert.match(log, /umbreld client/, "should attempt the `umbreld client` form first");
+  assert.match(log, /recreated via umbreld client/, "should succeed via `umbreld client` in the mock");
+});
+
+// ---------------------------------------------------------------------------
+// Fix #6: a bind with the right destination but the WRONG source must NOT count
+// as present -> recreate runs and repairs it.
+// ---------------------------------------------------------------------------
+
+test("restore: bind destination present but source wrong -> recreate runs and heals", async () => {
+  const { runner } = runScenario("bindWrongSource");
+  runner.start("manual");
+  const job = await waitForJobDone(runner);
+
+  assert.equal(stepState(job, "recreate"), "ok", "wrong-source bind must trigger a recreate");
+  assert.match(job.result as string, /healthy/i);
+});
+
+// ---------------------------------------------------------------------------
+// Fix #4: a mutating write backs up the previous file under <dataDir>/backups.
+// ---------------------------------------------------------------------------
+
+test("restore: patching the compose backs up the previous file into <dataDir>/backups", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "drp-restore-"));
+  try {
+    const settings = testSettings();
+    const adapter = createMockAdapter("composeUnpatched");
+    const runner = createRestoreRunner(adapter, () => settings, undefined, dir);
+    runner.start("manual");
+    const job = await waitForJobDone(runner);
+
+    assert.equal(stepState(job, "composePatch"), "ok");
+    assert.match(stepLog(job, "composePatch"), /backed up previous/, "should log the backup path");
+
+    const backups = readdirSync(join(dir, "backups"));
+    assert.ok(
+      backups.some((n) => n.startsWith("docker-compose.yml.") && n.endsWith(".bak")),
+      "a compose backup should have been written",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("restore: a hook that did not previously exist is NOT backed up", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "drp-restore-"));
+  try {
+    const settings = testSettings();
+    const adapter = createMockAdapter("hookMissing");
+    const runner = createRestoreRunner(adapter, () => settings, undefined, dir);
+    runner.start("manual");
+    const job = await waitForJobDone(runner);
+
+    assert.equal(stepState(job, "bootHook"), "ok");
+    // Nothing to back up (the file was absent) -> no pre-start backup, no log line.
+    assert.doesNotMatch(stepLog(job, "bootHook"), /backed up previous/);
+    const backupDir = join(dir, "backups");
+    if (existsSync(backupDir)) {
+      const hookBackups = readdirSync(backupDir).filter((n) => n.startsWith("pre-start."));
+      assert.equal(hookBackups.length, 0, "an absent hook must not be backed up");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

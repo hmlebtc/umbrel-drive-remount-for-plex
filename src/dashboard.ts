@@ -681,8 +681,9 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     setC("autoHealToggle", !!ah.enabled);
 
     var lr = s.lastRestore;
-    if (lr && lr.at) {
-      setHtml("lastRestoreLine", "last restore " + relSpan(lr.at) + " · " + esc(lr.trigger || "manual") + " · " + esc(String(lr.result != null ? lr.result : "")));
+    var lrAt = lr && (lr.at || lr.finishedAt || lr.startedAt);
+    if (lr && lrAt) {
+      setHtml("lastRestoreLine", "last restore " + relSpan(lrAt) + " · " + esc(lr.trigger || "manual") + " · " + esc(String(lr.result != null ? lr.result : "")));
     } else {
       setText("lastRestoreLine", "no restore has run yet");
     }
@@ -863,7 +864,7 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
   }
   function validateSettings(s) {
     var errs = {};
-    if (!/^[0-9a-fA-F-]{36}$/.test(s.uuid || "")) errs.uuid = "must be a 36-character UUID";
+    if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(s.uuid || "")) errs.uuid = "must be a canonical UUID (8-4-4-4-12 hex)";
     if (!s.fsType) errs.fsType = "required";
     if (!isAbsCleanPath(s.mountPoint)) errs.mountPoint = "must be an absolute path with no spaces, quotes, or backslashes";
     if (!s.mediaSubdir) errs.mediaSubdir = "required";

@@ -30,8 +30,11 @@ on:
         description: >-
           Publish a specific image version (e.g. 0.1.1) without a git tag.
           Fallback for when tag creation is unavailable; produces :<version>,
-          :v<version>, and :latest. Leave blank to publish only :latest.
-        required: false
+          :v<version>, and :latest. Mandatory - docker/metadata-action's
+          semver tag patterns only fire on a v* tag ref, so a blank value
+          here resolves to zero tags and the push step fails with
+          "tag is needed when pushing".
+        required: true
         type: string
 
 permissions:
@@ -102,6 +105,44 @@ jobs:
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "App version: $VER"
+
+      - name: Verify version lockstep
+        # Publish-only guard: umbrel-app.yml's version:, the image tag pinned
+        # in docker-compose.yml, and the version being released (the v* git
+        # tag, or the workflow_dispatch version input) must always agree.
+        # Catches a bump to one of the three lockstep files without the
+        # other two before it ever reaches GHCR.
+        if: steps.mode.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+
+          MANIFEST_VER="${{ steps.app_version.outputs.version }}"
+
+          COMPOSE_VER=$(grep -E '^\s*image:\s*ghcr\.io/' hmlebtc-drive-remount-for-plex/docker-compose.yml \
+                | head -1 \
+                | sed -E 's/.*:([0-9][0-9A-Za-z.+_-]*)[[:space:]]*$/\1/')
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            SOURCE_VER="${GITHUB_REF#refs/tags/v}"
+          else
+            SOURCE_VER="${{ inputs.version }}"
+          fi
+
+          echo "umbrel-app.yml version:       $MANIFEST_VER"
+          echo "docker-compose.yml image pin: $COMPOSE_VER"
+          echo "release source version:       $SOURCE_VER"
+
+          if [[ -z "$MANIFEST_VER" || "$MANIFEST_VER" == "unknown" || -z "$COMPOSE_VER" || -z "$SOURCE_VER" ]]; then
+            echo "::error::could not determine one or more versions (manifest='$MANIFEST_VER' compose='$COMPOSE_VER' source='$SOURCE_VER')"
+            exit 1
+          fi
+
+          if [[ "$MANIFEST_VER" != "$COMPOSE_VER" || "$MANIFEST_VER" != "$SOURCE_VER" ]]; then
+            echo "::error::version lockstep broken - umbrel-app.yml=$MANIFEST_VER docker-compose.yml=$COMPOSE_VER release=$SOURCE_VER (all three must match exactly before publishing)"
+            exit 1
+          fi
+
+          echo "Version lockstep OK: $MANIFEST_VER"
 
       - name: Compute image metadata
         id: meta

@@ -269,6 +269,29 @@ test("PUT /api/settings: a valid patch is accepted and applied", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Fix #7: /api/status lastRestore carries `at` (finishedAt ?? startedAt).
+// ---------------------------------------------------------------------------
+
+test("GET /api/status: lastRestore.at is populated after a restore is started", async () => {
+  const { ctx, cleanup } = buildCtx();
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      const started = await postJSON(baseUrl, "/api/restore", { confirm: true });
+      assert.equal(started.status, 200);
+
+      const { body } = await getJSON(baseUrl, "/api/status");
+      const lr = body.data.lastRestore;
+      assert.ok(lr, "expected a lastRestore summary once a job exists");
+      assert.equal(typeof lr.at, "string", "lastRestore.at must be a timestamp string");
+      assert.ok(lr.at.length > 0);
+      assert.ok("trigger" in lr && "result" in lr, "lastRestore must carry trigger + result");
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // /healthz
 // ---------------------------------------------------------------------------
 
