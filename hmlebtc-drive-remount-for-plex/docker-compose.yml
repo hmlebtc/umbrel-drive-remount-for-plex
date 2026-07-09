@@ -1,0 +1,70 @@
+# Umbrel docker-compose for Drive Remount for Plex.
+#
+# - `app_proxy` is Umbrel's auth + reverse-proxy sidecar (it adds Umbrel's
+#   login in front of the dashboard, which has no auth of its own - see
+#   server.ts's comment on that boundary).
+# - `web` is the daemon + dashboard, pulled from GHCR. It listens on 3012
+#   and keeps its persisted state (settings.json, activity log, host-file
+#   backups) under /data, bind-mounted to Umbrel's per-app persistent
+#   storage.
+#
+# `privileged: true` + `pid: "host"` + the docker.sock bind-mount below
+# are NOT the usual Umbrel app shape - they are the entire point of this
+# app. The daemon exists to do two things no unprivileged container can:
+#   1. Mount/inspect the host's external drive and rewrite host files
+#      (the boot hook, Plex's installed docker-compose.yml) via
+#      `nsenter -t 1 -m -u -i -n` - which only works because `pid: "host"`
+#      makes PID 1 in this container's pid namespace be the host's real
+#      init, and `privileged: true` grants the capabilities nsenter needs
+#      to re-enter its namespaces.
+#   2. Recreate the running Plex container after patching its compose
+#      file (`docker compose ... up -d --force-recreate`, or the
+#      umbreld-native restart) - which needs a real Docker socket, hence
+#      the /var/run/docker.sock bind-mount.
+# This is a broad, host-level capability grant. It is intentionally
+# undertaken only in this personal community app store - see the
+# README's "Privileged access" section for the full disclosure and why
+# this could never ship in Umbrel's official app store.
+#
+# These env values only SEED settings.json on first boot - after that
+# the daemon reads whatever is saved in settings.json (dashboard edits
+# or PUT /api/settings win), so an app update or container recreation
+# never clobbers a live configuration change.
+
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # Must match this compose project's web service. Umbrel uses the app
+      # dir name as the project prefix -> `<dir>_web_1`.
+      APP_HOST: hmlebtc-drive-remount-for-plex_web_1
+      APP_PORT: 3012
+
+  web:
+    # Pin the exact released version - never `:latest`, never `v`-prefixed.
+    # Bump in lockstep with umbrel-app.yml `version:` on every release.
+    image: ghcr.io/hmlebtc/umbrel-drive-remount-for-plex:0.1.0
+    restart: on-failure
+    stop_grace_period: 30s
+    # See the block comment above: both are required for the host-access
+    # model documented in the README, not optional hardening trade-offs.
+    privileged: true
+    pid: "host"
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DRP_HTTP_PORT: "3012"
+      DRP_DATA_DIR: /data
+      DRP_UUID: 555bf6f0-ae17-4137-adec-e91818854f1c
+      DRP_FSTYPE: ext4
+      DRP_MOUNT_POINT: /mnt/wdexternal
+      DRP_MEDIA_SUBDIR: media
+      DRP_FOLDERS: Movies,TVshows,Music
+      DRP_PLEX_APP_ID: plex
+      DRP_UMBREL_ROOT: /home/umbrel/umbrel
+      DRP_CONTAINER_MEDIA_PATH: /media/wdexternal
+      DRP_AUTOHEAL_ENABLED: "true"
+      DRP_AUTOHEAL_INTERVAL_SECONDS: "30"
+      DRP_AUTOHEAL_COOLDOWN_SECONDS: "300"

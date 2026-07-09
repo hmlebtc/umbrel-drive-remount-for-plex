@@ -1,0 +1,47 @@
+# Umbrel app manifest. Loaded when this repo is added as a Community App
+# Store. The directory name and the `id` below must be prefixed with the
+# store id from umbrel-app-store.yml (`hmlebtc-drive`).
+
+manifestVersion: 1
+id: hmlebtc-drive-remount-for-plex
+category: files
+name: Drive Remount for Plex
+version: "0.1.0"
+tagline: Keep an external drive permanently mounted and bound into Plex
+icon: https://raw.githubusercontent.com/hmlebtc/umbrel-drive-remount-for-plex/main/assets/icon-512.png
+# Umbrel renders the description literally - each paragraph is one physical
+# line, blank line between paragraphs. Do not soft-wrap.
+description: |
+  Keeping an external drive's media folder permanently visible to Plex on umbrelOS is fragile in three specific ways: a docker-compose.override.yml is invisible to Plex because umbreld starts every app with an explicit list of compose files that never includes an override; a manually added /etc/fstab entry lives on the root filesystem, which umbrelOS swaps between two OS slots on every update and wipes on the slot that isn't currently live; and umbrelOS's own USB auto-mount places drives under a path like <UMBREL_ROOT>/external/<label>, which can silently shift (gaining a " (2)" suffix) on reconnect - none of which Plex's compose file ever references, so the media folder just disappears from Plex sooner or later.
+
+  This app replaces all of that with one small always-running privileged container that is itself the persistence mechanism. On every boot it installs a tiny mount command into umbrelOS's officially supported, update-persistent custom-hooks/pre-start hook, which mounts the drive by filesystem UUID before umbreld even starts. It patches the media volume directly into Plex's installed docker-compose.yml (the live copy umbreld actually runs, not the pristine store file), so a normal Plex restart or Plex app update keeps the bind. A background monitor continuously checks the drive, the mount, the boot hook, the compose patch, and the running Plex container's bind, and can auto-heal by re-running the same steps - it only touches the Plex container itself when the running container is actually missing the bind. A dashboard behind Umbrel's own login shows live status, a one-click full restore or Plex restart, a job log, and activity history.
+
+  To do this the app runs privileged, shares the host's process namespace, and mounts the host's Docker socket, so it can read and write host files and recreate the Plex container directly - a broad, host-level capability grant that no official Umbrel app is given. This is done deliberately, only for this personal community app store (official store policy forbids it), and is documented in full in the README before you install.
+developer: hmlebtc
+website: https://github.com/hmlebtc/umbrel-drive-remount-for-plex
+repo: https://github.com/hmlebtc/umbrel-drive-remount-for-plex
+support: https://github.com/hmlebtc/umbrel-drive-remount-for-plex/issues
+# Host port Umbrel publishes the app on - must be unique across all
+# installed apps. The daemon listens on 3012 inside the container
+# (docker-compose APP_PORT / DRP_HTTP_PORT); only this host-facing port
+# is a distinct number chosen to avoid collisions with other apps.
+port: 7912
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: hmlebtc
+submission: https://github.com/hmlebtc/umbrel-drive-remount-for-plex
+releaseNotes: |
+  v0.1.0 - first release.
+
+  Keeps an external drive's media folder permanently bound into Plex across umbrelOS
+  updates, Plex app updates, USB reconnects, and reboots. Installs a boot-time mount
+  hook under umbrelOS's persistent custom-hooks/pre-start path, patches the media
+  volume into Plex's installed docker-compose.yml, and runs a monitor that detects
+  drift (missing mount, missing hook, missing compose patch, or a running Plex
+  container without the bind) and can auto-heal it, recreating the Plex container
+  only when its running bind is actually missing. Dashboard with status tiles, a
+  one-click full restore and Plex restart, live job log, activity history, and a
+  settings form. Runs privileged with host process-namespace and Docker-socket
+  access - see the README before installing.

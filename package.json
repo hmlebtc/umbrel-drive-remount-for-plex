@@ -1,0 +1,20 @@
+{
+  "name": "umbrel-drive-remount-for-plex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Umbrel app that keeps an external drive mounted for Plex on umbrelOS: a boot hook, a Plex compose patch, a monitor with auto-heal, and a dashboard.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "test": "npm run build && node --test dist/*.test.js",
+    "dev": "npm run build && node dist/main.js"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^22"
+  }
+}

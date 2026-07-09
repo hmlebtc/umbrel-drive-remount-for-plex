@@ -1,0 +1,28 @@
+# Keep the build context small + free of host-specific artefacts.
+# Note: this list mirrors .gitignore's runtime-state entries but is
+# independent - Docker build context is constructed from the filesystem,
+# not from `git ls-files`, so anything you don't want in the image must be
+# listed here even if it's also gitignored.
+
+# Node / build outputs (rebuilt inside the image)
+node_modules
+dist
+*.tsbuildinfo
+
+# Operator-specific runtime state (must NEVER bake into an image)
+data
+.env
+
+# Repo / IDE noise
+.git
+.github
+
+# Docs + Umbrel Community App Store files (live at the repo root for
+# Umbrel's Add App Store flow; not needed inside the daemon image - the
+# app reads its own version from package.json / the APP_VERSION build arg,
+# not from umbrel-app.yml).
+assets
+scripts
+hmlebtc-drive-remount-for-plex
+README.md
+*.md

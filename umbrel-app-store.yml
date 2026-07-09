@@ -1,0 +1,14 @@
+# Umbrel Community App Store manifest. Lives at the repo root because
+# Umbrel's "Add App Store" flow expects this file there.
+#
+# Operators add this store to their Umbrel via:
+#   Settings → App Stores → Add App Store
+#   → https://github.com/hmlebtc/umbrel-drive-remount-for-plex
+# Umbrel then walks each top-level directory of this repo looking for
+# umbrel-app.yml manifests. The app dir name must be prefixed with the
+# `id` below - here that's `hmlebtc-drive-remount-for-plex/`.
+
+id: hmlebtc-drive
+# Umbrel renders this as "<name> App Store".
+name: Drive Remount for Plex
+tagline: Keep an external drive permanently mounted and bound into Plex

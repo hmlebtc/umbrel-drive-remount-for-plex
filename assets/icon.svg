@@ -1,0 +1,38 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Drive Remount for Plex app icon. A rounded square with a dark navy
+    gradient background, a light external-drive glyph (body + two vent
+    grooves + a status LED + a connector tab poking out the bottom edge),
+    and an amber play triangle overlaid on the drive face - amber
+    (#e5a00d) is Plex's own brand color, so the triangle reads as "this
+    drive is bound into Plex". The same shapes are re-drawn analytically
+    (not parsed from this file) by scripts/render_icons.py to produce
+    assets/icon-512.png / icon-256.png - keep both in sync by hand if the
+    design ever changes.
+  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1b3552"/>
+      <stop offset="100%" stop-color="#081422"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded-square background, rx ~ 22% of the canvas -->
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="url(#bg)"/>
+
+  <!-- External drive body -->
+  <rect x="86" y="160" width="340" height="192" rx="36" ry="36" fill="#e7edf5"/>
+
+  <!-- Vent grooves near the top of the drive -->
+  <rect x="136" y="178" width="120" height="10" rx="5" ry="5" fill="#b9c4d4"/>
+  <rect x="136" y="196" width="120" height="10" rx="5" ry="5" fill="#b9c4d4"/>
+
+  <!-- Status LED -->
+  <circle cx="166" cy="326" r="11" fill="#22c55e"/>
+
+  <!-- Connector tab poking out the bottom edge of the case -->
+  <rect x="236" y="344" width="40" height="30" rx="6" ry="6" fill="#0c1a2c"/>
+
+  <!-- Amber play triangle, badged on the drive face (Plex brand amber) -->
+  <polygon points="196,196 196,316 336,256" fill="#e5a00d"/>
+</svg>

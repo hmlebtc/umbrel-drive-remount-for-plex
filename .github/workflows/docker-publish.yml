@@ -1,0 +1,171 @@
+# Docker image build + publish, plus a plain npm test run.
+#
+# Runs in two modes:
+#
+# - **Verify** (push to main, pull request): runs `npm test` on Node 22,
+#   and builds the image for `linux/amd64` only, *without* publishing.
+#   Catches both source regressions and Dockerfile regressions before
+#   they reach a release tag.
+# - **Publish** (`v*` tag, manual dispatch): builds for both
+#   `linux/amd64` and `linux/arm64` and pushes to
+#   `ghcr.io/<owner>/umbrel-drive-remount-for-plex` with every relevant
+#   tag permutation (vX.Y.Z, vX.Y, vX, latest) - gated on the same
+#   `npm test` passing first.
+#
+# ARM64 is mandatory for appliance deployments - Umbrel runs on Pi-class
+# hardware. We only build it on the publish path because QEMU-emulated
+# arm64 builds take ~5x longer than native amd64.
+
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Publish a specific image version (e.g. 0.1.1) without a git tag.
+          Fallback for when tag creation is unavailable; produces :<version>,
+          :v<version>, and :latest. Leave blank to publish only :latest.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install, build, test
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] || [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        if: steps.mode.outputs.publish == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.mode.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read app version from umbrel-app.yml
+        id: app_version
+        run: |
+          set -euo pipefail
+          VER=$(grep -E '^version:' hmlebtc-drive-remount-for-plex/umbrel-app.yml \
+                | head -1 \
+                | sed -E 's/^version:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+          if [[ -z "$VER" ]]; then
+            echo "::warning::could not parse version: from umbrel-app.yml; image will report 'unknown'"
+            VER="unknown"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "App version: $VER"
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/umbrel-drive-remount-for-plex
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # v-prefixed mirrors. docker/metadata-action's default semver
+            # patterns strip the `v` (so a `v0.1.0` git tag becomes a
+            # `0.1.0` image tag). That's fine for GHCR's native UI but
+            # breaks anyone who copies the git tag verbatim into a docker
+            # pull. Publishing both forms makes `:v0.1.0` and `:0.1.0`
+            # resolve to the same image, so a docker-compose pin of either
+            # shape just works.
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
+            # Manual-dispatch fallback: publish an explicit version when tag
+            # creation is unavailable. `type=semver` above only fires on a v*
+            # git ref, so a workflow_dispatch with a `version` input produces
+            # the bare + v-prefixed image tags here instead.
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=raw,value=v${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=raw,value=latest,enable=${{ (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')) || inputs.version != '' }}
+
+      - name: Build (and push on tags)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ steps.mode.outputs.platforms }}
+          push: ${{ steps.mode.outputs.publish }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Bake the short git SHA + app version into the image so
+          # /api/status reports the real running build instead of
+          # `gitSha: "dev"` / `version: "unknown"`. .dockerignore strips
+          # `.git/` AND the umbrel-app.yml manifest dir from the build
+          # context, so without these build-args the app has no way to
+          # learn either value at build time. APP_VERSION is parsed from
+          # hmlebtc-drive-remount-for-plex/umbrel-app.yml at workflow time -
+          # the same canonical source the Umbrel community store reads, so
+          # the in-image version cannot drift from the published release.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ steps.app_version.outputs.version }}
+          # Cache layers in the GHA cache for faster subsequent builds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Docker build" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Mode: \`${{ steps.mode.outputs.publish == 'true' && 'publish' || 'verify' }}\`  " >> "$GITHUB_STEP_SUMMARY"
+          echo "Platforms: \`${{ steps.mode.outputs.platforms }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ steps.mode.outputs.publish }}" == "true" ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Published tags" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
