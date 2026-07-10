@@ -163,7 +163,10 @@ before installing this app:
 - A legacy `docker-compose.override.yml` next to Plex's compose file is likewise harmless now (umbreld never
   reads it - see [The problem](#the-problem) above) and is reported informationally
   (`legacyOverridePresent`) rather than deleted, in case you want to keep it around for a non-Umbrel use of
-  the same compose directory.
+  the same compose directory. When one is detected, the dashboard's Actions card shows a **Remove legacy
+  override** button so you don't have to SSH in to clean it up: it backs the file up to
+  `<UMBREL_ROOT>/app-data/hmlebtc-drive-remount-for-plex/data/backups`, then deletes it, and clears the
+  status note once it's gone.
 
 ## Development
 

@@ -32,7 +32,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -45,6 +45,7 @@ import { createApiServer, type AppContext } from "./server.js";
 
 interface Harness {
   ctx: AppContext;
+  dir: string;
   cleanup: () => void;
 }
 
@@ -61,8 +62,9 @@ function buildCtx(opts: { mock?: boolean } = {}): Harness {
     startedAt: new Date().toISOString(),
     version: "0.1.0",
     gitSha: "test-sha",
+    dataDir: dir,
   };
-  return { ctx, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { ctx, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 async function withServer<T>(ctx: AppContext, fn: (baseUrl: string) => Promise<T>): Promise<T> {
@@ -159,6 +161,9 @@ class GatedFirstExistsAdapter implements HostAdapter {
   }
   writeFileAtomic(hostPath: string, content: string, mode?: number): Promise<void> {
     return this.base.writeFileAtomic(hostPath, content, mode);
+  }
+  removeFile(hostPath: string): Promise<void> {
+    return this.base.removeFile(hostPath);
   }
   listDir(hostPath: string): Promise<string[] | null> {
     return this.base.listDir(hostPath);
@@ -329,6 +334,70 @@ test("POST /api/mock/scenario: works (200 ok:true) when the server was booted wi
       });
       assert.equal(status, 200);
       assert.equal(body.ok, true);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/remove-legacy-override (v0.1.2): confirm gate + backup + idempotency.
+// ---------------------------------------------------------------------------
+
+test("POST /api/remove-legacy-override: without confirm:true -> 4xx envelope error", async () => {
+  const { ctx, cleanup } = buildCtx();
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      const { status, body } = await postJSON(baseUrl, "/api/remove-legacy-override", {});
+      assert.ok(status >= 400 && status < 500, `expected 4xx, got ${status}`);
+      assert.equal(body.ok, false);
+      assert.equal(typeof body.error, "string");
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("POST /api/remove-legacy-override: present override is backed up + removed, then status clears; a second call is a no-op", async () => {
+  const { ctx, dir, cleanup } = buildCtx();
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      // (b) The mock ships the legacy override present.
+      const before = await getJSON(baseUrl, "/api/status");
+      assert.equal(before.status, 200);
+      assert.equal(before.body.data.composePatch.legacyOverridePresent, true);
+
+      // Remove it: removed:true with a truthy backupPath, and a backup file
+      // actually lands under ${dataDir}/backups.
+      const rm = await postJSON(baseUrl, "/api/remove-legacy-override", { confirm: true });
+      assert.equal(rm.status, 200);
+      assert.equal(rm.body.ok, true);
+      assert.equal(rm.body.data.removed, true);
+      assert.equal(typeof rm.body.data.backupPath, "string");
+      assert.ok(rm.body.data.backupPath.length > 0);
+
+      const backups = readdirSync(join(dir, "backups"));
+      const mine = backups.filter(
+        (n) => n.startsWith("docker-compose.override.yml.") && n.endsWith(".bak"),
+      );
+      assert.equal(mine.length, 1, "expected exactly one override backup file");
+
+      // Status now reports the override gone (button + yellow note clear).
+      const after = await getJSON(baseUrl, "/api/status");
+      assert.equal(after.body.data.composePatch.legacyOverridePresent, false);
+
+      // (c) A second call is idempotent: nothing to remove, no backup.
+      const again = await postJSON(baseUrl, "/api/remove-legacy-override", { confirm: true });
+      assert.equal(again.status, 200);
+      assert.equal(again.body.ok, true);
+      assert.equal(again.body.data.removed, false);
+      assert.equal(again.body.data.backupPath, null);
+
+      // No second backup file was written.
+      const backups2 = readdirSync(join(dir, "backups")).filter(
+        (n) => n.startsWith("docker-compose.override.yml.") && n.endsWith(".bak"),
+      );
+      assert.equal(backups2.length, 1, "a no-op remove must not write another backup");
     });
   } finally {
     cleanup();

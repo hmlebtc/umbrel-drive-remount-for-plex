@@ -322,6 +322,7 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       <button class="btn btn-sm danger" id="restoreBtn" type="button">Run full restore</button>
       <button class="btn btn-sm" id="restartPlexBtn" type="button">Restart Plex</button>
       <button class="btn btn-sm" id="checkNowBtn" type="button">Check now</button>
+      <button class="btn btn-sm" id="removeLegacyOverrideBtn" type="button" style="display:none">Remove legacy override</button>
       <label class="autoheal-toggle" for="autoHealToggle"><input id="autoHealToggle" type="checkbox"><span>Auto-heal</span></label>
       <div class="last-restore" id="lastRestoreLine"></div>
     </div>
@@ -684,6 +685,9 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
 
     setC("autoHealToggle", !!ah.enabled);
 
+    var cp = s.composePatch || {};
+    show("removeLegacyOverrideBtn", cp.legacyOverridePresent === true);
+
     var lr = s.lastRestore;
     var lrAt = lr && (lr.at || lr.finishedAt || lr.startedAt);
     if (lr && lrAt) {
@@ -975,6 +979,17 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     else { toast(res.error, "error"); }
     unbusy(btn, old);
     loadEvents();
+  });
+
+  $("removeLegacyOverrideBtn").addEventListener("click", async function () {
+    if (!window.confirm("Remove the unused docker-compose.override.yml? umbreld ignores it. It will be backed up to /data/backups first.")) return;
+    var btn = this;
+    var old = busy(btn, "Removing…");
+    var res = await apiPost("/api/remove-legacy-override", { confirm: true });
+    if (res.ok) { toast((res.data && res.data.removed) ? "Legacy override removed" : "No legacy override found", "ok"); }
+    else { toast(res.error, "error"); }
+    unbusy(btn, old);
+    loadStatus(); loadEvents();
   });
 
   $("autoHealToggle").addEventListener("change", async function () {

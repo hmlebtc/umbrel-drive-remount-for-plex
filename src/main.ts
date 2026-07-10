@@ -39,6 +39,7 @@ function main(): void {
     gitSha: GIT_SHA,
     monitor,
     events,
+    dataDir,
   };
 
   const server = createApiServer(ctx);

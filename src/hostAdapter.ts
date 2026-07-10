@@ -16,7 +16,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 
 import { DockerApi } from './dockerApi.js';
@@ -44,6 +44,8 @@ export interface HostAdapter {
   readFile(hostPath: string): Promise<string | null>;
   /** Atomically write a host file (tmp + rename); optional octal mode. */
   writeFileAtomic(hostPath: string, content: string, mode?: number): Promise<void>;
+  /** Delete a host file; a missing file (ENOENT) is a no-op, not an error. */
+  removeFile(hostPath: string): Promise<void>;
   /** True if the host path exists (following the final symlink's presence). */
   exists(hostPath: string): Promise<boolean>;
   /** Directory entries, or null if the path is missing / not a directory. */
@@ -95,6 +97,15 @@ export class RealHostAdapter implements HostAdapter {
     await writeFile(tmp, content, mode !== undefined ? { mode } : {});
     if (mode !== undefined) await chmod(tmp, mode);
     await rename(tmp, full);
+  }
+
+  async removeFile(hostPath: string): Promise<void> {
+    try {
+      await unlink(toHostView(hostPath));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // already gone -> no-op
+      throw err;
+    }
   }
 
   async exists(hostPath: string): Promise<boolean> {

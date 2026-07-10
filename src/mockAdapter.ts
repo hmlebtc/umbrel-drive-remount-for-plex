@@ -55,6 +55,19 @@ services:
       TZ: UTC
 `;
 
+/**
+ * A leftover, user-authored override from a previous manual solution. umbreld
+ * IGNORES override files entirely (it starts apps with explicit --file flags),
+ * so this is inert — but the mock ships it present (mirroring the user's real
+ * box) so composePatch.legacyOverridePresent is true by default and the
+ * "remove legacy override" action is exercisable end-to-end.
+ */
+const LEGACY_OVERRIDE = `services:
+  server:
+    volumes:
+      - /mnt/wdexternal/media:/media
+`;
+
 const HOSTNAME = 'umbrel-mock';
 const UUID_DEVICE = '/dev/sdb1';
 
@@ -159,6 +172,7 @@ class MockHostAdapterImpl implements MockHostAdapter {
       files: new Map<string, string>([
         [hookPath(this.s), currentHook],
         [composePath(this.s), patched],
+        [legacyOverridePath(this.s), LEGACY_OVERRIDE],
       ]),
       container: { exists: true, running: true, binds: this.bindsFromCompose(patched) },
       deviceFolders: { Movies: 12, TVshows: 8, Music: 20 },
@@ -238,6 +252,10 @@ class MockHostAdapterImpl implements MockHostAdapter {
 
   async writeFileAtomic(hostPath: string, content: string): Promise<void> {
     this.state.files.set(hostPath, content);
+  }
+
+  async removeFile(hostPath: string): Promise<void> {
+    this.state.files.delete(hostPath); // Map.delete is a no-op when absent
   }
 
   async exists(hostPath: string): Promise<boolean> {

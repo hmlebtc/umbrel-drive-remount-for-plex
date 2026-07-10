@@ -12,6 +12,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { DASHBOARD_HTML, FAVICON_SVG } from './dashboard.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
+import { removeLegacyOverride } from './legacyOverride.js';
 import type { Monitor } from './monitor.js';
 import type { RestoreRunner } from './restore.js';
 import type { SettingsStore } from './settings.js';
@@ -30,6 +31,8 @@ export interface AppContext {
   gitSha: string;
   monitor?: Monitor;
   events?: EventLog;
+  /** App /data dir; where legacy-override backups are written (backups.ts). */
+  dataDir?: string;
 }
 
 function errMsg(e: unknown): string {
@@ -208,6 +211,25 @@ async function handleMockScenario(ctx: AppContext, req: IncomingMessage, res: Se
   return ok(res, { scenario });
 }
 
+async function handleRemoveLegacyOverride(
+  ctx: AppContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const body = await readBody(req);
+  if (body.tooLarge) return fail(res, 413, 'request body too large');
+  if (!body.ok) return fail(res, 400, 'could not read request body');
+  const parsed = parseJson(body.text);
+  if (!parsed.ok) return fail(res, 400, 'invalid JSON body');
+  if (parsed.value.confirm !== true) {
+    return fail(res, 400, 'confirmation required: send {"confirm": true}');
+  }
+  // Independent of the restore single-flight lock (different file) — never gated
+  // on a running job.
+  const result = await removeLegacyOverride(ctx.adapter, ctx.settings.get(), ctx.dataDir, ctx.events);
+  return ok(res, result);
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -239,6 +261,7 @@ async function route(ctx: AppContext, req: IncomingMessage, res: ServerResponse)
   if (method === 'POST' && path === '/api/restore') return handleRestore(ctx, req, res, 'manual');
   if (method === 'POST' && path === '/api/restart-plex') return handleRestore(ctx, req, res, 'restart-plex');
   if (method === 'POST' && path === '/api/auto-heal') return handleAutoHeal(ctx, req, res);
+  if (method === 'POST' && path === '/api/remove-legacy-override') return handleRemoveLegacyOverride(ctx, req, res);
   if (method === 'POST' && path === '/api/reset-failures') {
     ctx.monitor?.resetFailures();
     return ok(res, { reset: true });
