@@ -45,6 +45,25 @@ export function hookPath(s: Settings): string {
   return posix.join(s.umbrelRoot, 'custom-hooks', 'pre-start');
 }
 
+/**
+ * umbreld's external-storage base (spec section 0): `<umbrelRoot>/external`.
+ * umbreld mounts each partition at `<externalBase>/<sanitizedLabel>`; this is
+ * the ONLY directory the cooperative backing binds from and the ONLY directory
+ * reaping is ever allowed to touch.
+ */
+export function externalBase(s: Settings): string {
+  return posix.join(s.umbrelRoot, 'external');
+}
+
+/**
+ * umbreld's filesystem-label sanitizer (spec section 0): strips every character
+ * outside `[a-zA-Z0-9 '_-]`. Used to know which `<externalBase>/<name>` and
+ * `<name> (N)` directories are ours to reap / bind.
+ */
+export function sanitizeLabel(label: string): string {
+  return label.replace(/[^a-zA-Z0-9 '_-]/g, '');
+}
+
 /** Expected Docker container name for the Plex `server` service. */
 export function containerName(s: Settings): string {
   return `${s.plexAppId}_server_1`;

@@ -38,7 +38,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { bookRestoreOutcome, decide, type RestoreBookkeeping } from "./monitor.js";
-import type { AppStatus, MonitorHistory, RestoreJob, Settings } from "./types.js";
+import { plexNeedsRecreate } from "./backingEngine.js";
+import { probeStatus } from "./status.js";
+import { createMockAdapter } from "./mockAdapter.js";
+import type { AppStatus, BackingRecord, MonitorHistory, RestoreJob, Settings } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -80,10 +83,22 @@ function healthyStatus(overrides: Partial<AppStatus> = {}): AppStatus {
       legacyOverridePresent: false,
       legacyFstabEntryPresent: false,
     },
-    plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [] },
+    plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [], liveOk: true, startedAt: "2026-07-08T11:59:00.000Z" },
     media: { ok: true, folders: [{ name: "Movies", present: true, entries: 12 }] },
     autoHeal: { enabled: true, lastCheckAt: "2026-07-08T12:00:00.000Z", lastActionAt: null, consecutiveFailures: 0, suspended: false },
     lastRestore: null,
+    // v0.2.0: AppStatus gained backing + warnings. These monitor tests exercise
+    // the CLASSIC decision table, so backing.mode is "classic" (isHealthy then
+    // takes the v0.1.x mount/plex/media path — behaviour unchanged).
+    backing: {
+      mode: "classic",
+      active: "direct",
+      umbrelMount: { found: false, path: null, readable: false },
+      bindGeneration: 0,
+      lastBindChangeAt: null,
+      reaped: { dirs: 0, mounts: 0 },
+    },
+    warnings: [],
     ...overrides,
   } as AppStatus;
 }
@@ -149,7 +164,7 @@ test("decide: suspended (consecutiveFailures >= max) -> none, even when broken a
 test("decide: drive absent -> none, even if plex is also not found", () => {
   const status = healthyStatus({
     drive: { present: false, device: null },
-    plex: { found: false, containerName: null, state: null, bindOk: false, binds: [] },
+    plex: { found: false, containerName: null, state: null, bindOk: false, binds: [], liveOk: true, startedAt: null },
   });
   const history = baseHistory({ drivePresentPrev: false });
   const result = decide(status, baseSettings(), history);
@@ -162,7 +177,7 @@ test("decide: drive absent -> none, even if plex is also not found", () => {
 
 test("decide: drive present but plex container not found -> alert", () => {
   const status = healthyStatus({
-    plex: { found: false, containerName: null, state: null, bindOk: false, binds: [] },
+    plex: { found: false, containerName: null, state: null, bindOk: false, binds: [], liveOk: true, startedAt: null },
   });
   const history = baseHistory();
   const result = decide(status, baseSettings(), history);
@@ -371,4 +386,65 @@ test("bookRestoreOutcome: null job -> updates nothing, jobRunning stays true", (
   });
   assert.equal(out.consecutiveFailures, 2);
   assert.equal(out.jobRunning, true);
+});
+
+// ===========================================================================
+// plexNeedsRecreate (spec section 5): the bind-generation + liveOk recreate rule.
+// Recreate Plex when it started BEFORE our last bind change (holds a dead view),
+// OR its in-container view is dead (liveOk false) while host media is healthy.
+// ===========================================================================
+
+function rec(overrides: Partial<BackingRecord> = {}): BackingRecord {
+  return {
+    mode: "cooperative",
+    active: "umbrel-bind",
+    boundTo: "/home/umbrel/umbrel/external/wdexternal",
+    bindGeneration: 2,
+    lastBindChangeAt: "2026-07-08T12:00:00.000Z",
+    graceStartedAt: null,
+    ...overrides,
+  };
+}
+
+test("plexNeedsRecreate: Plex not running -> no recreate", () => {
+  const status = healthyStatus({
+    plex: { found: true, containerName: "plex_server_1", state: "exited", bindOk: false, binds: [], liveOk: true, startedAt: null },
+  });
+  assert.equal(plexNeedsRecreate(status, rec()).recreate, false);
+});
+
+test("plexNeedsRecreate: container StartedAt BEFORE the last bind change -> recreate (dead view)", () => {
+  const status = healthyStatus({
+    plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [], liveOk: true, startedAt: "2026-07-08T11:00:00.000Z" },
+  });
+  // lastBindChangeAt (12:00) is AFTER the container start (11:00) -> stale bind view.
+  const r = plexNeedsRecreate(status, rec({ lastBindChangeAt: "2026-07-08T12:00:00.000Z" }));
+  assert.equal(r.recreate, true);
+});
+
+test("plexNeedsRecreate: liveOk false while host media is healthy -> recreate", () => {
+  const status = healthyStatus({
+    plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [], liveOk: false, startedAt: "2026-07-08T13:00:00.000Z" },
+    media: { ok: true, folders: [{ name: "Movies", present: true, entries: 12 }] },
+  });
+  // No lastBindChangeAt so the StartedAt clause is skipped; liveOk drives it.
+  const r = plexNeedsRecreate(status, rec({ lastBindChangeAt: null }));
+  assert.equal(r.recreate, true);
+});
+
+test("plexNeedsRecreate: started AFTER the bind and liveOk true -> no recreate", () => {
+  const status = healthyStatus({
+    plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [], liveOk: true, startedAt: "2026-07-08T13:00:00.000Z" },
+  });
+  assert.equal(plexNeedsRecreate(status, rec({ lastBindChangeAt: "2026-07-08T12:00:00.000Z" })).recreate, false);
+});
+
+test("plexNeedsRecreate: integration — mock 'plexStartedBeforeBind' reports an early StartedAt that trips the rule", async () => {
+  const settings = baseSettings({ mountMode: "cooperative", graceSec: 180 } as Partial<Settings>);
+  const status = await probeStatus(createMockAdapter("plexStartedBeforeBind"), settings);
+  // The mock's container started long before any bind.
+  assert.equal(status.plex.found, true);
+  assert.equal(status.plex.state, "running");
+  const r = plexNeedsRecreate(status, rec({ lastBindChangeAt: "2026-07-14T00:00:00.000Z" }));
+  assert.equal(r.recreate, true, `expected recreate; plex.startedAt=${status.plex.startedAt}`);
 });

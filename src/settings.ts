@@ -20,7 +20,11 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 
 import { log } from './log.js';
-import type { AutoHealSettings, Settings } from './types.js';
+import type { AutoHealSettings, MountMode, Settings } from './types.js';
+
+export const GRACE_MIN_SEC = 60;
+export const GRACE_MAX_SEC = 900;
+export const GRACE_DEFAULT_SEC = 180;
 
 // ---------------------------------------------------------------------------
 // Defaults — these MUST match the healthy mock host state and B3's compose
@@ -37,6 +41,8 @@ export function defaultSettings(): Settings {
     plexAppId: 'plex',
     umbrelRoot: '/home/umbrel/umbrel',
     containerMediaPath: '/media/wdexternal',
+    mountMode: 'classic',
+    graceSec: 180,
     autoHeal: {
       enabled: true,
       intervalSec: 30,
@@ -166,6 +172,14 @@ export function validateSettings(input: Settings): ValidationResult {
     reset('umbrelRoot', 'umbrelRoot must be an absolute path with no spaces or shell metacharacters');
   }
 
+  c.mountMode = String(c.mountMode ?? '').trim() as MountMode;
+  if (c.mountMode !== 'classic' && c.mountMode !== 'cooperative') {
+    reset('mountMode', 'mountMode must be "classic" or "cooperative"');
+  }
+
+  // graceSec is clamped (never a hard error), mirroring the auto-heal numerics.
+  c.graceSec = clampInt(c.graceSec, GRACE_MIN_SEC, GRACE_MAX_SEC, GRACE_DEFAULT_SEC);
+
   if (!Array.isArray(c.folders)) {
     reset('folders', 'folders must be a non-empty array of media folder names');
   } else {
@@ -252,6 +266,8 @@ export function seedSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): Setti
   if (env.DRP_PLEX_APP_ID) c.plexAppId = env.DRP_PLEX_APP_ID;
   if (env.DRP_UMBREL_ROOT) c.umbrelRoot = env.DRP_UMBREL_ROOT;
   if (env.DRP_CONTAINER_MEDIA_PATH) c.containerMediaPath = env.DRP_CONTAINER_MEDIA_PATH;
+  if (env.DRP_MOUNT_MODE) c.mountMode = env.DRP_MOUNT_MODE.trim() as MountMode;
+  if (env.DRP_GRACE_SECONDS) c.graceSec = Number(env.DRP_GRACE_SECONDS);
 
   const enabled = envBool(env.DRP_AUTOHEAL_ENABLED);
   if (enabled !== undefined) c.autoHeal.enabled = enabled;

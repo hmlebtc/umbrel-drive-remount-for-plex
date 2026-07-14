@@ -24,6 +24,15 @@ export interface AutoHealSettings {
   requireConsecutiveBroken: number;
 }
 
+/**
+ * How the stable path /mnt/wdexternal is backed (spec sections 1, 3):
+ *   - "classic":     direct `mount -t <fsType> /dev/disk/by-uuid/<uuid>` (v0.1.x
+ *                    behaviour, kept byte-for-byte; blocks umbreld's automount).
+ *   - "cooperative": `mount --bind <umbrelMountPath> /mnt/wdexternal` so the ONE
+ *                    drive serves both umbrelOS Files and Plex.
+ */
+export type MountMode = 'classic' | 'cooperative';
+
 export interface Settings {
   /** Filesystem UUID of the external drive (from /dev/disk/by-uuid). */
   uuid: string;
@@ -41,6 +50,10 @@ export interface Settings {
   umbrelRoot: string;
   /** Path the media appears at INSIDE the Plex container (bind destination). */
   containerMediaPath: string;
+  /** Backing mode for the stable path (default "classic"; upgrade-safe). */
+  mountMode: MountMode;
+  /** Seconds to wait for umbreld to mount the drive before classic fallback (60–900, default 180). */
+  graceSec: number;
   autoHeal: AutoHealSettings;
 }
 
@@ -87,6 +100,16 @@ export interface PlexStatus {
   state: string | null;
   bindOk: boolean;
   binds: ContainerBind[];
+  /** Container State.StartedAt (ISO), for the bind-generation recreate rule (spec section 5). */
+  startedAt: string | null;
+  /**
+   * Spec section 5: in-container liveness. `docker exec <plex> ls <mediaPath>`
+   * succeeded (media is actually visible INSIDE the running container) — distinct
+   * from config-level {@link bindOk}. `true` when not applicable / not probed
+   * (plex absent or not running) so it never becomes the sole health discriminator
+   * there; only a probed `false` marks the live view dead.
+   */
+  liveOk: boolean;
 }
 
 export interface MediaFolderStatus {
@@ -119,6 +142,115 @@ export interface RestoreSummary {
   result: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Backing (spec sections 1-4, 8) — the stable-path indirection layer.
+// ---------------------------------------------------------------------------
+
+/** Which backing currently serves /mnt/wdexternal (spec section 1). */
+export type BackingActive = 'umbrel-bind' | 'direct' | 'none';
+
+/**
+ * One decoded /proc/1/mountinfo record (spec section 2). Field order per the
+ * kernel format: mountId parentId major:minor(dropped) root mountpoint options
+ * <optional-fields> " - " fstype source superOptions.
+ */
+export interface MountInfoEntry {
+  mountId: number;
+  parentId: number;
+  root: string;
+  mountpoint: string;
+  options: string[];
+  fsType: string;
+  source: string;
+  superOptions: string[];
+}
+
+/**
+ * Persisted at ${DRP_DATA_DIR}/backing.json (atomic writes). The bind record
+ * that lets discovery distinguish a bind-of-umbrel from a direct mount (both
+ * look identical in mountinfo), reconciled against the live mount table each
+ * tick (spec section 2).
+ */
+export interface BackingRecord {
+  mode: MountMode;
+  active: BackingActive;
+  /** The umbrelOS /External mount path our bind currently points at, or null. */
+  boundTo: string | null;
+  /** Monotonic counter bumped on every bind/mount we make (Plex-liveness rule). */
+  bindGeneration: number;
+  /** ISO time of the last bind/mount change (Plex recreate + handover cooldown anchor). */
+  lastBindChangeAt: string | null;
+  /** ISO time the current grace window started (boot/drive-arrival/handover), or null. */
+  graceStartedAt: string | null;
+}
+
+/** Live view of umbreld's /External mount of our device (spec section 8). */
+export interface UmbrelMountStatus {
+  found: boolean;
+  path: string | null;
+  readable: boolean;
+}
+
+export interface ReapCounts {
+  dirs: number;
+  mounts: number;
+}
+
+/** status.backing (spec section 8). */
+export interface BackingStatus {
+  mode: MountMode;
+  active: BackingActive;
+  umbrelMount: UmbrelMountStatus;
+  bindGeneration: number;
+  lastBindChangeAt: string | null;
+  /** Present only while a grace window is counting down. */
+  graceRemainingSec?: number;
+  reaped: ReapCounts;
+}
+
+/**
+ * Pure classification of the mount table (output of classifyBacking, input to
+ * backingDecide). Carries only what is derivable from mountinfo + the record;
+ * the engine layers the live readability probe onto umbrelMount.found before
+ * deciding (an unreadable umbrelOS mount is not a usable backing target).
+ */
+export interface BackingView {
+  umbrelMount: {
+    found: boolean;
+    path: string | null;
+    mountId: number | null;
+    source: string | null;
+  };
+  stablePath: {
+    mounted: boolean;
+    source: string;
+    root: string;
+    /** A direct device mount of the fs root (classic backing). */
+    direct: boolean;
+    /** Our bind of an umbrelOS mount (per the persisted record). */
+    bindOfUmbrel: boolean;
+    /** The recorded bind points at a path that is no longer the live umbrelOS mount. */
+    boundElsewhere: boolean;
+    /** The current stable-path mount is stale/dead (device gone, renumbered, or bind source unmounted). */
+    stale: boolean;
+  };
+  record: BackingRecord | null;
+}
+
+/** Actions produced by the backing ladder (spec section 3). */
+export type BackingAction = 'none' | 'wait' | 'bind' | 'direct-mount' | 'release' | 'handover';
+
+export interface BackingDecision {
+  action: BackingAction;
+  reason: string;
+}
+
+/** Standing UI warnings (spec section 8). */
+export type WarningCode =
+  | 'FORMAT_DIALOG_EXPECTED'
+  | 'EJECTED_IN_UMBREL'
+  | 'WAITING_FOR_UMBREL_MOUNT';
+
 export interface AppStatus {
   timestamp: string;
   version: string;
@@ -131,13 +263,22 @@ export interface AppStatus {
   media: MediaStatus;
   autoHeal: AutoHealStatus;
   lastRestore: RestoreSummary | null;
+  /** Spec section 8: the stable-path backing detail. */
+  backing: BackingStatus;
+  /** Spec section 8: standing operator warnings. */
+  warnings: WarningCode[];
 }
 
 // ---------------------------------------------------------------------------
 // Restore job (spec section 7) — the /api/job payload.
 // ---------------------------------------------------------------------------
 
-export type RestoreTrigger = 'auto' | 'manual' | 'restart-plex';
+export type RestoreTrigger =
+  | 'auto'
+  | 'manual'
+  | 'restart-plex'
+  | 'switch-cooperative'
+  | 'switch-classic';
 
 export type StepName =
   | 'preflight'
@@ -145,7 +286,14 @@ export type StepName =
   | 'mount'
   | 'composePatch'
   | 'recreate'
-  | 'verify';
+  | 'verify'
+  // Migration job steps (spec section 6).
+  | 'set-mode'
+  | 'reap'
+  | 'unmount'
+  | 'rescan'
+  | 'wait-umbrel'
+  | 'bind';
 
 export type StepState = 'pending' | 'running' | 'ok' | 'failed' | 'skipped';
 

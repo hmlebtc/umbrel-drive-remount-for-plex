@@ -23,10 +23,19 @@
  * `|| true`.
  */
 
+import type { MountMode } from './types.js';
+
 export interface HookOptions {
   uuid: string;
   mountPoint: string;
   fsType: string;
+  /**
+   * Backing mode (spec section 7). Omitted / "classic" renders the v0.1.x
+   * wait-and-mount-by-UUID block VERBATIM. "cooperative" renders a mkdir-only
+   * block that MUST NOT mount the raw device (mounting it would trip umbreld's
+   * "skip already-mounted" rule at its boot scan and defeat coexistence).
+   */
+  mountMode?: MountMode;
 }
 
 export interface EnsureHookResult {
@@ -41,6 +50,19 @@ const SHEBANG = '#!/bin/sh';
 
 /** The managed block lines, from BEGIN marker to END marker (inclusive). */
 function renderBlockLines(opts: HookOptions): string[] {
+  if (opts.mountMode === 'cooperative') {
+    // Cooperative: only ensure the stable indirection dir exists. umbreld mounts
+    // the drive under external/ at daemon start; our monitor then binds it and
+    // recreates Plex. Mounting the raw device HERE would trip umbreld's
+    // "skip already-mounted" rule and defeat coexistence.
+    return [
+      BEGIN_MARKER,
+      '# cooperative mode: do NOT mount the raw device here (umbreld mounts it under',
+      '# external/ and our monitor binds it). We only ensure the stable path exists.',
+      `mkdir -p '${opts.mountPoint}'`,
+      END_MARKER,
+    ];
+  }
   const dev = `/dev/disk/by-uuid/${opts.uuid}`;
   return [
     BEGIN_MARKER,

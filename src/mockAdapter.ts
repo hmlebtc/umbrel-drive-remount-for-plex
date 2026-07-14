@@ -1,16 +1,32 @@
 /**
  * Stateful in-memory HostAdapter (spec sections 9, 10) used for MOCK=1 runs and
  * unit/integration tests. It simulates a real umbrelOS host: a by-uuid device,
- * a mount table, host rootfs files (the pre-start hook, Plex's compose,
- * optional legacy override), media folders on the drive, and the Plex
- * container's docker state.
+ * a mount table (both /proc/1/mounts AND /proc/1/mountinfo), host rootfs files
+ * (the pre-start hook, Plex's compose, optional legacy override), media folders
+ * on the drive, the Plex container's docker state, AND — new in v0.2.0 — a
+ * faithful umbreld coexistence simulation (spec section 0):
+ *
+ *   (a) umbreld's auto-mounter SKIPS a partition already mounted anywhere (the
+ *       lsblk skip rule): while our app holds ANY mount of the raw device,
+ *       umbreld never mounts it under <umbrelRoot>/external.
+ *   (b) umbreld mounts at <externalBase>/<sanitizedLabel>, and getUniqueName()
+ *       appends " (2)"… when a leftover directory already occupies the name
+ *       (mount-path drift).
+ *   (c) a simulated disk-change event (replug) re-runs umbreld's scan, optionally
+ *       renumbering the device (sda1 -> sdb1) so old mounts go dead.
+ *   (d) eject (in umbrelOS Files) unmounts umbreld's OWN /External mount.
  *
  * CRITICAL: actions CONVERGE. `mount` adds a fresh (non-stale) mount entry;
- * `umount` removes it; a Plex recreate (`docker compose up`)
- * re-reads the CURRENT compose file and rebuilds the container's binds from it —
- * so once composePatch has written the media bind, a recreate makes the
- * container actually carry it. That is what lets a real restore run in MOCK=1
- * drive every healable scenario to a genuinely healthy end state.
+ * `umount` removes it; a Plex recreate (`docker compose up`) re-reads the CURRENT
+ * compose file and rebuilds the container's binds from it — AND refreshes the
+ * container's in-container media view (docker-exec liveness). That is what lets a
+ * real restore / switch run in MOCK=1 drive every healable scenario to a
+ * genuinely healthy end state.
+ *
+ * The coexistence scenarios set up an initial host state; deterministic
+ * transitions (umbreld mounting late, an eject, a replug, a Plex recreate) are
+ * driven by the MockControl methods so tests never depend on wall-clock or tick
+ * timing.
  */
 
 import { ensureHookBlock } from './bootHook.js';
@@ -22,6 +38,7 @@ import { defaultSettings } from './settings.js';
 import type { ContainerBind, Settings } from './types.js';
 
 export type MockScenario =
+  // v0.1.x classic scenarios (unchanged).
   | 'healthy'
   | 'driveAbsent'
   | 'notMounted'
@@ -30,9 +47,42 @@ export type MockScenario =
   | 'bindWrongSource'
   | 'composeUnpatched'
   | 'hookMissing'
-  | 'plexStopped';
+  | 'plexStopped'
+  // v0.2.0 coexistence scenarios (spec section 9).
+  | 'coopHealthy'
+  | 'umbrelMountsLate'
+  | 'umbrelPathDrift'
+  | 'umbrelNeverMounts'
+  | 'ejectedInUmbrel'
+  | 'bindStaleAfterReplug'
+  | 'leftoverDirs'
+  | 'plexStartedBeforeBind';
 
-export interface MockHostAdapter extends HostAdapter {
+/**
+ * Test-facing controls to drive the umbreld simulation deterministically. These
+ * are the events a real host would produce asynchronously (umbreld finishing its
+ * boot scan, a user pressing Eject, a USB re-enumeration, a Plex recreate).
+ */
+export interface MockControl {
+  /** Run umbreld's #mountExternalDevices scan now (respects the lsblk skip rule). */
+  simulateUmbreldMount(): void;
+  /** Eject in umbrelOS Files: umbreld unmounts its OWN /External mount(s). */
+  simulateEject(): void;
+  /** USB re-enumeration; `renumber` makes the device come back as a new /dev node. */
+  simulateReplug(opts?: { renumber?: boolean }): void;
+  /** `docker compose up` equivalent: rebuild binds + refresh the in-container view. */
+  recreatePlex(): void;
+  /** The live umbrelOS /External mount path of our device, or null. */
+  umbrelMountPath(): string | null;
+  /** Inject a Plex recreate failure (docker compose up exits non-zero) — for the revert path. */
+  setRecreateFails(fails: boolean): void;
+  /** Make the sysfs replug unavailable (no USB `authorized` dir) — for the manual-replug path. */
+  setReplugAvailable(available: boolean): void;
+  /** Disable umbreld's automounter entirely (models a stuck automount). */
+  setUmbreldEnabled(enabled: boolean): void;
+}
+
+export interface MockHostAdapter extends HostAdapter, MockControl {
   setScenario(scenario: MockScenario | string): void;
   getScenario(): MockScenario;
 }
@@ -69,7 +119,15 @@ const LEGACY_OVERRIDE = `services:
 `;
 
 const HOSTNAME = 'umbrel-mock';
-const UUID_DEVICE = '/dev/sdb1';
+/** Legacy scenarios keep the v0.1.x device so their /proc/1/mounts is byte-identical. */
+const LEGACY_UUID_DEVICE = '/dev/sdb1';
+/** Coexistence scenarios model the live box: LABEL=wdexternal on /dev/sda1 (disk sda). */
+const COOP_UUID_DEVICE = '/dev/sda1';
+const ROOT_DEVICE = '/dev/sda2';
+/** The disk's raw filesystem LABEL (sanitized -> the umbrelOS /External dir name). */
+const DRIVE_LABEL = 'wdexternal';
+/** A plausible USB device dir the sysfs replug walk (BackingEngine.sysfsReplug) ascends to. */
+const USB_DEVICE_DIR = '/sys/devices/pci0000:00/usb1/1-1';
 
 function normalizeScenario(raw: string): MockScenario | null {
   const key = raw.trim().toLowerCase();
@@ -93,10 +151,28 @@ function normalizeScenario(raw: string): MockScenario | null {
     hookmissing: 'hookMissing',
     'plex-stopped': 'plexStopped',
     plexstopped: 'plexStopped',
+    // Coexistence (spec section 9 frozen names).
+    'coop-healthy': 'coopHealthy',
+    coophealthy: 'coopHealthy',
+    'umbrel-mounts-late': 'umbrelMountsLate',
+    umbrelmountslate: 'umbrelMountsLate',
+    'umbrel-path-drift': 'umbrelPathDrift',
+    umbrelpathdrift: 'umbrelPathDrift',
+    'umbrel-never-mounts': 'umbrelNeverMounts',
+    umbrelnevermounts: 'umbrelNeverMounts',
+    'ejected-in-umbrel': 'ejectedInUmbrel',
+    ejectedinumbrel: 'ejectedInUmbrel',
+    'bind-stale-after-replug': 'bindStaleAfterReplug',
+    bindstaleafterreplug: 'bindStaleAfterReplug',
+    'leftover-dirs': 'leftoverDirs',
+    leftoverdirs: 'leftoverDirs',
+    'plex-started-before-bind': 'plexStartedBeforeBind',
+    plexstartedbeforebind: 'plexStartedBeforeBind',
   };
   return map[key] ?? null;
 }
 
+/** Encode /proc field separators the kernel escapes (space/tab/backslash). */
 function encodeMountField(field: string): string {
   return field
     .replace(/\\/g, '\\134')
@@ -104,14 +180,57 @@ function encodeMountField(field: string): string {
     .replace(/\t/g, '\\011');
 }
 
+/** Deterministic major:minor for a device node (cosmetic; parseMountInfo drops it). */
+function majorMinor(source: string): string {
+  const m = /^\/dev\/sd([a-z])(\d+)$/.exec(source);
+  if (m) {
+    const letter = m[1]!.charCodeAt(0) - 'a'.charCodeAt(0);
+    const part = Number(m[2]);
+    return `8:${letter * 16 + part}`;
+  }
+  return '0:0';
+}
+
+type MountOwner = 'system' | 'app-direct' | 'app-bind' | 'umbrel';
+
+/** A mount table entry rich enough to synthesize BOTH /proc/1/mounts and mountinfo. */
+interface MockMount extends MountEntry {
+  mountId: number;
+  parentId: number;
+  root: string;
+  superOptions: string[];
+  owner: MountOwner;
+}
+
 interface MockState {
   scenario: MockScenario;
+  /** True for the v0.2.0 coexistence scenarios. */
+  coop: boolean;
   uuidPresent: boolean;
   uuidDevice: string;
-  mounts: MountEntry[];
+  /** Whole-disk node name (for the sysfs replug path), e.g. "sda". */
+  disk: string;
+  mounts: MockMount[];
   files: Map<string, string>;
-  container: { exists: boolean; running: boolean; binds: ContainerBind[] };
+  /** Directories under <externalBase>: name (absolute) -> hasFiles (non-mount contents). */
+  externalDirs: Map<string, boolean>;
+  container: {
+    exists: boolean;
+    running: boolean;
+    binds: ContainerBind[];
+    /** Container State.StartedAt (ISO), for the bind-generation recreate rule (§5). */
+    startedAt: string | null;
+    /** What `docker exec <plex> ls <mediaPath>` sees, or null when the path errors. */
+    view: string[] | null;
+  };
   deviceFolders: Record<string, number>;
+  /** Set false only in umbrelNeverMounts so simulateUmbreldMount is inert. */
+  umbreldEnabled: boolean;
+  /** When true, `docker compose up` fails (recreate revert path). */
+  recreateFails: boolean;
+  /** When true, the sysfs USB `authorized` dir exists (the replug can be synthesized). */
+  replugAvailable: boolean;
+  nextMountId: number;
 }
 
 class MockHostAdapterImpl implements MockHostAdapter {
@@ -132,6 +251,16 @@ class MockHostAdapterImpl implements MockHostAdapter {
     this.state = this.build(scenario);
   }
 
+  // --- Path helpers ---------------------------------------------------------
+
+  private externalBase(): string {
+    return `${this.s.umbrelRoot}/external`;
+  }
+
+  private sanitizedLabel(): string {
+    return DRIVE_LABEL.replace(/[^a-zA-Z0-9 '_-]/g, '');
+  }
+
   private substituteEnv(value: string): string {
     return value
       .replace(/\$\{APP_DATA_DIR\}/g, appDataDir(this.s))
@@ -146,7 +275,9 @@ class MockHostAdapterImpl implements MockHostAdapter {
     }));
   }
 
-  private build(scenario: MockScenario): MockState {
+  // --- Scenario construction ------------------------------------------------
+
+  private baseState(scenario: MockScenario, coop: boolean, uuidDevice: string): MockState {
     const patched = ensureVolumeLine(BASE_COMPOSE, {
       hostPath: hostMediaPath(this.s),
       containerPath: this.s.containerMediaPath,
@@ -155,28 +286,91 @@ class MockHostAdapterImpl implements MockHostAdapter {
       uuid: this.s.uuid,
       mountPoint: this.s.mountPoint,
       fsType: this.s.fsType,
+      // Coexistence scenarios model a system already IN cooperative mode, whose
+      // update-persistent hook is the mkdir-only cooperative block (a classic
+      // mount-by-UUID block here would trip umbreld's skip rule at boot and make
+      // status.bootHook.ok false — see spec §7). Legacy scenarios keep the
+      // v0.1.x classic hook byte-for-byte.
+      mountMode: coop ? 'cooperative' : 'classic',
     }).text;
-
-    const freshMount: MountEntry = {
-      source: UUID_DEVICE,
-      target: this.s.mountPoint,
-      fsType: this.s.fsType,
-      options: ['rw', 'relatime'],
-    };
-
-    const state: MockState = {
+    return {
       scenario,
+      coop,
       uuidPresent: true,
-      uuidDevice: UUID_DEVICE,
-      mounts: [{ ...freshMount }],
+      uuidDevice,
+      disk: /^\/dev\/(sd[a-z])\d+$/.exec(uuidDevice)?.[1] ?? 'sda',
+      mounts: [],
       files: new Map<string, string>([
         [hookPath(this.s), currentHook],
         [composePath(this.s), patched],
         [legacyOverridePath(this.s), LEGACY_OVERRIDE],
       ]),
-      container: { exists: true, running: true, binds: this.bindsFromCompose(patched) },
+      externalDirs: new Map<string, boolean>(),
+      container: {
+        exists: true,
+        running: true,
+        binds: this.bindsFromCompose(patched),
+        startedAt: new Date().toISOString(),
+        view: null,
+      },
       deviceFolders: { Movies: 12, TVshows: 8, Music: 20 },
+      umbreldEnabled: true,
+      recreateFails: false,
+      replugAvailable: true,
+      nextMountId: 30,
     };
+  }
+
+  private mkMount(
+    partial: Omit<MockMount, 'mountId' | 'parentId' | 'root' | 'superOptions'> &
+      Partial<Pick<MockMount, 'root' | 'superOptions' | 'parentId'>>,
+    state: MockState,
+  ): MockMount {
+    const ro = partial.options.includes('ro') && !partial.options.includes('rw');
+    return {
+      mountId: state.nextMountId++,
+      parentId: partial.parentId ?? 24,
+      root: partial.root ?? '/',
+      superOptions: partial.superOptions ?? [ro ? 'ro' : 'rw'],
+      source: partial.source,
+      target: partial.target,
+      fsType: partial.fsType,
+      options: partial.options,
+      owner: partial.owner,
+    };
+  }
+
+  private build(scenario: MockScenario): MockState {
+    const coop = this.isCoop(scenario);
+    return coop ? this.buildCoop(scenario) : this.buildLegacy(scenario);
+  }
+
+  private isCoop(scenario: MockScenario): boolean {
+    return (
+      scenario === 'coopHealthy' ||
+      scenario === 'umbrelMountsLate' ||
+      scenario === 'umbrelPathDrift' ||
+      scenario === 'umbrelNeverMounts' ||
+      scenario === 'ejectedInUmbrel' ||
+      scenario === 'bindStaleAfterReplug' ||
+      scenario === 'leftoverDirs' ||
+      scenario === 'plexStartedBeforeBind'
+    );
+  }
+
+  // --- Legacy (v0.1.x) scenarios — behaviour byte-identical to v0.1.2 -------
+
+  private buildLegacy(scenario: MockScenario): MockState {
+    const state = this.baseState(scenario, false, LEGACY_UUID_DEVICE);
+    const freshMount = this.mkMount(
+      { source: LEGACY_UUID_DEVICE, target: this.s.mountPoint, fsType: this.s.fsType, options: ['rw', 'relatime'], owner: 'app-direct' },
+      state,
+    );
+    state.mounts = [freshMount];
+    // v0.1.x containers see the media directly (probeLiveOk = `docker exec ls`
+    // exit 0). Keeping the live view means classic scenarios stay liveOk:true,
+    // so isHealthy is byte-for-byte what it was before liveOk existed.
+    state.container.view = Object.keys(state.deviceFolders);
 
     switch (scenario) {
       case 'healthy':
@@ -189,20 +383,17 @@ class MockHostAdapterImpl implements MockHostAdapter {
         state.mounts = [];
         break;
       case 'mountStale':
-        // Mounted, but the backing device no longer matches the live by-uuid
-        // device (drive re-enumerated after a replug).
         state.mounts = [
-          { source: '/dev/sda1', target: this.s.mountPoint, fsType: this.s.fsType, options: ['rw', 'relatime'] },
+          this.mkMount(
+            { source: '/dev/sda1', target: this.s.mountPoint, fsType: this.s.fsType, options: ['rw', 'relatime'], owner: 'app-direct' },
+            state,
+          ),
         ];
         break;
       case 'bindMissing':
-        // Compose IS patched, but the running container predates the patch.
         state.container.binds = this.bindsFromCompose(BASE_COMPOSE);
         break;
       case 'bindWrongSource':
-        // Compose IS patched and the container has a bind to the right
-        // destination, but its host source is STALE (e.g. an old mount path) —
-        // must be treated as bind-missing (media not actually visible).
         state.container.binds = this.bindsFromCompose(BASE_COMPOSE).concat({
           source: '/mnt/OLDPATH/media',
           destination: this.s.containerMediaPath,
@@ -220,6 +411,217 @@ class MockHostAdapterImpl implements MockHostAdapter {
         break;
     }
     return state;
+  }
+
+  // --- Coexistence (v0.2.0) scenarios ---------------------------------------
+
+  private umbrelMountAt(state: MockState, name: string): MockMount {
+    const path = `${this.externalBase()}/${name}`;
+    state.externalDirs.set(path, false);
+    return this.mkMount(
+      { source: state.uuidDevice, target: path, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'umbrel', root: '/' },
+      state,
+    );
+  }
+
+  private appBindAt(state: MockState, source: string): MockMount {
+    return this.mkMount(
+      { source, target: this.s.mountPoint, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'app-bind', root: '/' },
+      state,
+    );
+  }
+
+  private appDirectAt(state: MockState, source: string): MockMount {
+    return this.mkMount(
+      { source, target: this.s.mountPoint, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'app-direct', root: '/' },
+      state,
+    );
+  }
+
+  private buildCoop(scenario: MockScenario): MockState {
+    const state = this.baseState(scenario, true, COOP_UUID_DEVICE);
+    const base = this.externalBase();
+    const label = this.sanitizedLabel();
+
+    switch (scenario) {
+      case 'coopHealthy': {
+        const um = this.umbrelMountAt(state, label);
+        state.mounts = [um, this.appBindAt(state, state.uuidDevice)];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
+      case 'umbrelMountsLate': {
+        // Just booted: umbreld has not scanned yet. No /External mount, no bind.
+        state.mounts = [];
+        state.container.view = null;
+        break;
+      }
+      case 'umbrelPathDrift': {
+        // A leftover EMPTY dir occupies the clean name, so umbreld drifted to "(2)".
+        state.externalDirs.set(`${base}/${label}`, false);
+        const um = this.umbrelMountAt(state, `${label} (2)`);
+        state.mounts = [um];
+        state.container.view = null;
+        break;
+      }
+      case 'umbrelNeverMounts': {
+        // umbreld will not produce an /External mount (simulate a stuck automount).
+        state.umbreldEnabled = false;
+        state.mounts = [];
+        state.container.view = null;
+        break;
+      }
+      case 'ejectedInUmbrel': {
+        // Drive present; user pressed Eject in Files -> umbreld's mount is gone,
+        // but our recorded bind of it is still up (independent mount).
+        state.externalDirs.set(`${base}/${label}`, false);
+        state.mounts = [this.appBindAt(state, state.uuidDevice)];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
+      case 'bindStaleAfterReplug': {
+        // Device re-enumerated sda1 -> sdb1. Old umbrel mount + our old bind still
+        // reference sda1 (now DEAD). umbreld re-mounted the new device, drifting
+        // to "(2)" because the old (dead) name dir still occupies the clean name.
+        const dead = '/dev/sda1';
+        state.uuidDevice = '/dev/sdb1';
+        state.disk = 'sdb';
+        state.externalDirs.set(`${base}/${label}`, false);
+        const deadUmbrel = this.mkMount(
+          { source: dead, target: `${base}/${label}`, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'umbrel', root: '/' },
+          state,
+        );
+        const deadBind = this.mkMount(
+          { source: dead, target: this.s.mountPoint, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'app-bind', root: '/' },
+          state,
+        );
+        const liveUmbrel = this.umbrelMountAt(state, `${label} (2)`);
+        state.mounts = [deadUmbrel, deadBind, liveUmbrel];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
+      case 'leftoverDirs': {
+        // Hygiene: an empty leftover dir + a foreign dir + a dead-mount dir under
+        // the external base, plus a healthy live umbrel mount + bind on "(2)".
+        state.externalDirs.set(`${base}/${label}`, false); // empty leftover (reapable)
+        state.externalDirs.set(`${base}/someones-backup`, true); // foreign, non-empty (never touch)
+        const deadUmbrel = this.mkMount(
+          { source: '/dev/sda9', target: `${base}/${label} (3)`, fsType: 'ext4', options: ['rw', 'relatime'], owner: 'umbrel', root: '/' },
+          state,
+        );
+        state.externalDirs.set(`${base}/${label} (3)`, false); // occupied by a dead mount
+        const um = this.umbrelMountAt(state, `${label} (2)`);
+        state.mounts = [deadUmbrel, um, this.appBindAt(state, state.uuidDevice)];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
+      case 'plexStartedBeforeBind': {
+        // Backing looks correct (umbrel mount + our bind, host media visible) but
+        // Plex started BEFORE the bind, so its in-container view is empty/dead.
+        const um = this.umbrelMountAt(state, label);
+        state.mounts = [um, this.appBindAt(state, state.uuidDevice)];
+        // Container started LONG before the bind (bind-generation rule §5) and its
+        // in-container view is empty/dead until a recreate re-resolves the source.
+        state.container.startedAt = '2026-01-01T00:00:00.000Z';
+        state.container.view = []; // docker exec ls -> empty -> liveOk false
+        break;
+      }
+      default:
+        break;
+    }
+    return state;
+  }
+
+  // --- umbreld simulation (spec section 0) ----------------------------------
+
+  private rawDeviceIsMounted(state: MockState): boolean {
+    // lsblk reports mountpoints of the raw partition: ANY mount of it (ours OR
+    // umbreld's own) makes umbreld's auto-mounter `continue` (skip).
+    return state.mounts.some((m) => m.source === state.uuidDevice);
+  }
+
+  private getUniqueName(state: MockState, base: string): string {
+    const full = (name: string): string => `${this.externalBase()}/${name}`;
+    if (!state.externalDirs.has(full(base))) return base;
+    for (let n = 2; n < 100; n++) {
+      const candidate = `${base} (${n})`;
+      if (!state.externalDirs.has(full(candidate))) return candidate;
+    }
+    return `${base} (99)`;
+  }
+
+  private umbreldScan(): void {
+    const state = this.state;
+    if (!state.umbreldEnabled) return;
+    if (!state.uuidPresent) return;
+    if (this.rawDeviceIsMounted(state)) return; // lsblk skip rule
+    const name = this.getUniqueName(state, this.sanitizedLabel());
+    state.mounts.push(this.umbrelMountAt(state, name));
+  }
+
+  simulateUmbreldMount(): void {
+    this.umbreldScan();
+  }
+
+  simulateEject(): void {
+    const state = this.state;
+    state.mounts = state.mounts.filter((m) => m.owner !== 'umbrel');
+  }
+
+  simulateReplug(opts: { renumber?: boolean } = {}): void {
+    const state = this.state;
+    // Surprise removal: the device disappears; existing mounts of it linger DEAD.
+    state.uuidPresent = false;
+    if (opts.renumber) {
+      const nextLetter = String.fromCharCode(state.disk.charCodeAt(state.disk.length - 1) + 1);
+      state.disk = `sd${nextLetter}`;
+      state.uuidDevice = `/dev/${state.disk}1`;
+    }
+    // Re-arrival: udev settles, umbreld re-scans on the device-add event.
+    state.uuidPresent = true;
+    this.umbreldScan();
+  }
+
+  recreatePlex(): void {
+    this.doRecreate();
+  }
+
+  setRecreateFails(fails: boolean): void {
+    this.state.recreateFails = fails;
+  }
+
+  setReplugAvailable(available: boolean): void {
+    this.state.replugAvailable = available;
+  }
+
+  setUmbreldEnabled(enabled: boolean): void {
+    this.state.umbreldEnabled = enabled;
+  }
+
+  umbrelMountPath(): string | null {
+    const live = this.state.mounts.filter(
+      (m) => m.owner === 'umbrel' && m.target.startsWith(`${this.externalBase()}/`) && !this.isDead(m),
+    );
+    if (live.length === 0) return null;
+    // Newest mountId wins (spec section 2).
+    return live.reduce((a, b) => (b.mountId > a.mountId ? b : a)).target;
+  }
+
+  // --- Liveness helpers -----------------------------------------------------
+
+  /** A mount whose backing device is no longer the live drive is dead/stale. */
+  private isDead(m: MockMount): boolean {
+    if (m.owner === 'system') return false;
+    if (!this.state.uuidPresent) return true;
+    return m.source !== this.state.uuidDevice;
+  }
+
+  private liveMountAt(path: string): MockMount | null {
+    let found: MockMount | null = null;
+    for (const m of this.state.mounts) {
+      if (m.target === path && !this.isDead(m)) found = m;
+    }
+    return found;
   }
 
   private isUnderMount(p: string): boolean {
@@ -244,6 +646,10 @@ class MockHostAdapterImpl implements MockHostAdapter {
     return false;
   }
 
+  private mediaHostVisible(): boolean {
+    return this.mountedActive();
+  }
+
   // --- HostAdapter ----------------------------------------------------------
 
   async readFile(hostPath: string): Promise<string | null> {
@@ -258,8 +664,29 @@ class MockHostAdapterImpl implements MockHostAdapter {
     this.state.files.delete(hostPath); // Map.delete is a no-op when absent
   }
 
+  /**
+   * rmdir semantics (real adapter: fs.rmdir — rmdir ONLY): a missing dir is a
+   * no-op (ENOENT); a dir that still carries a mount OR non-mount contents fails
+   * (ENOTEMPTY); an empty, unmounted dir is removed.
+   */
+  async removeDir(hostPath: string): Promise<void> {
+    const state = this.state;
+    if (!state.externalDirs.has(hostPath)) return; // ENOENT -> no-op
+    const occupiedByMount = state.mounts.some((m) => m.target === hostPath);
+    const hasFiles = state.externalDirs.get(hostPath) === true;
+    if (occupiedByMount || hasFiles) {
+      throw Object.assign(new Error(`ENOTEMPTY: directory not empty, rmdir '${hostPath}'`), { code: 'ENOTEMPTY' });
+    }
+    state.externalDirs.delete(hostPath);
+  }
+
   async exists(hostPath: string): Promise<boolean> {
     if (hostPath === byUuidPath(this.s)) return this.state.uuidPresent;
+    if (this.state.externalDirs.has(hostPath)) return true;
+    // sysfs USB device dir attributes the replug walk (sysfsReplug) looks for.
+    if (hostPath === `${USB_DEVICE_DIR}/authorized` || hostPath === `${USB_DEVICE_DIR}/idVendor`) {
+      return this.state.replugAvailable;
+    }
     if (this.isUnderMount(hostPath)) {
       return this.mountedActive() && this.mediaPathExists(hostPath);
     }
@@ -267,7 +694,33 @@ class MockHostAdapterImpl implements MockHostAdapter {
   }
 
   async listDir(hostPath: string): Promise<string[] | null> {
-    if (!this.isUnderMount(hostPath) || !this.mountedActive()) return null;
+    const base = this.externalBase();
+
+    // The external base itself lists its child directory names.
+    if (hostPath === base) {
+      const prefix = `${base}/`;
+      return [...this.state.externalDirs.keys()]
+        .filter((p) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
+        .map((p) => p.slice(prefix.length));
+    }
+
+    // A live umbrelOS /External mount reads as the drive root (readability probe).
+    const umbrelLive = this.liveMountAt(hostPath);
+    if (umbrelLive && umbrelLive.owner === 'umbrel') {
+      const sub = this.s.mediaSubdir.trim();
+      return sub === '' ? Object.keys(this.state.deviceFolders) : [sub.split('/')[0]!];
+    }
+    // A dead /External mount dir is unreadable.
+    if (
+      hostPath.startsWith(`${base}/`) &&
+      this.state.mounts.some((m) => m.target === hostPath && this.isDead(m))
+    ) {
+      return null;
+    }
+
+    if (!this.isUnderMount(hostPath) || !this.mountedActive()) {
+      return this.state.externalDirs.has(hostPath) ? [] : null;
+    }
     const mediaRoot = hostMediaPath(this.s);
     if (hostPath === mediaRoot) return Object.keys(this.state.deviceFolders);
     if (hostPath.startsWith(`${mediaRoot}/`)) {
@@ -276,10 +729,6 @@ class MockHostAdapterImpl implements MockHostAdapter {
       if (n === undefined) return null;
       return Array.from({ length: n }, (_, i) => `item-${i + 1}`);
     }
-    // The mount root itself lists as the top of the drive (the media subdir, or
-    // the media folders directly when mediaSubdir is empty). This makes the
-    // status/restore "mount target readable" (EIO) probe see a live mount as
-    // readable — and a stale mount (mountedActive() false, above) as null.
     if (hostPath === this.s.mountPoint) {
       const sub = this.s.mediaSubdir.trim();
       return sub === '' ? Object.keys(this.state.deviceFolders) : [sub.split('/')[0]!];
@@ -291,6 +740,10 @@ class MockHostAdapterImpl implements MockHostAdapter {
     if (hostPath === byUuidPath(this.s)) {
       return this.state.uuidPresent ? this.state.uuidDevice : null;
     }
+    // sysfs resolution for the switch job's replug step.
+    if (hostPath === `/sys/block/${this.state.disk}`) {
+      return `/sys/devices/pci0000:00/usb1/1-1/block/${this.state.disk}`;
+    }
     return this.state.files.has(hostPath) ? hostPath : null;
   }
 
@@ -298,7 +751,7 @@ class MockHostAdapterImpl implements MockHostAdapter {
     const lines = [
       'sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0',
       'proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0',
-      '/dev/sda2 / ext4 rw,relatime 0 0',
+      `${ROOT_DEVICE} / ext4 rw,relatime 0 0`,
     ];
     for (const m of this.state.mounts) {
       lines.push(
@@ -308,10 +761,43 @@ class MockHostAdapterImpl implements MockHostAdapter {
     return `${lines.join('\n')}\n`;
   }
 
+  /**
+   * Synthesize /proc/1/mountinfo (spec section 2). Field order per the kernel:
+   *   mountId parentId major:minor root mountpoint options <optional…> - fstype source superOptions
+   * Includes the pseudo/root mounts an optional-field parser must tolerate.
+   */
+  async readProcMountInfo(): Promise<string> {
+    const lines = [
+      '21 24 0:20 / /sys sysfs rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw',
+      '22 24 0:4 / /proc proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw',
+      `24 1 ${majorMinor(ROOT_DEVICE)} / / rw,relatime shared:1 - ext4 ${ROOT_DEVICE} rw,errors=remount-ro`,
+    ];
+    for (const m of this.state.mounts) {
+      const opts = m.options.join(',') || 'rw';
+      const sopts = m.superOptions.join(',') || 'rw';
+      lines.push(
+        `${m.mountId} ${m.parentId} ${majorMinor(m.source)} ${encodeMountField(m.root)} ` +
+          `${encodeMountField(m.target)} ${opts} - ${m.fsType} ${encodeMountField(m.source)} ${sopts}`,
+      );
+    }
+    return `${lines.join('\n')}\n`;
+  }
+
   async exec(argv: string[], _opts?: ExecOptions): Promise<ExecResult> {
     const ok = (stdout = ''): ExecResult => ({ code: 0, stdout, stderr: '' });
     const fail = (code: number, stderr = ''): ExecResult => ({ code, stdout: '', stderr });
     const cmd = argv[0] ?? '';
+    const joined = argv.join(' ');
+
+    // In-container liveness: `docker exec <plex> ls <mediaPath>` (spec section 5).
+    if (cmd === 'docker' && argv[1] === 'exec') {
+      if (!this.state.container.exists || !this.state.container.running) {
+        return fail(1, 'mock: container not running');
+      }
+      const view = this.state.container.view;
+      if (view === null) return fail(2, 'ls: cannot access: Input/output error');
+      return ok(view.length > 0 ? `${view.join('\n')}\n` : '');
+    }
 
     switch (cmd) {
       case 'mount':
@@ -323,12 +809,24 @@ class MockHostAdapterImpl implements MockHostAdapter {
       }
       case 'mkdir':
         return ok();
+      case 'rmdir': {
+        const target = argv[argv.length - 1] ?? '';
+        try {
+          await this.removeDir(target);
+          return ok();
+        } catch (e) {
+          return fail(1, e instanceof Error ? e.message : String(e));
+        }
+      }
       case 'mountpoint': {
         const target = argv[argv.length - 1] ?? '';
         return this.state.mounts.some((m) => m.target === target) ? ok() : fail(1);
       }
+      case 'readlink':
+        return this.realpath(argv[argv.length - 1] ?? '').then((r) => (r !== null ? ok(`${r}\n`) : fail(1)));
       case 'docker':
         if (argv.includes('up') || argv.includes('restart')) {
+          if (this.state.recreateFails) return fail(1, 'mock: docker compose up failed');
           this.doRecreate();
           return ok('recreated via docker compose');
         }
@@ -336,19 +834,40 @@ class MockHostAdapterImpl implements MockHostAdapter {
       case 'hostname':
         return ok(HOSTNAME);
       default:
+        // The switch job's rescan step (spec section 6 step 4) synthesizes a
+        // replug via sysfs (authorized 0 -> 1, or a driver unbind/bind). The
+        // RE-authorize / rebind (or a generic rescan) fires umbreld's device
+        // scan; a bare deauthorize (`echo 0`) does not.
+        if (/authorized|\/sys\/block|\/bind|udevadm|partprobe|blockdev|rescan/i.test(joined)) {
+          if (!/echo\s+0\s*>|\/unbind/i.test(joined)) this.umbreldScan();
+          return ok();
+        }
         return ok();
     }
   }
 
   private doMount(argv: string[]): boolean {
     const target = argv[argv.length - 1] ?? '';
-    const device = argv[argv.length - 2] ?? '';
+    const isBind = argv.includes('--bind');
+    const src = argv[argv.length - 2] ?? '';
     const fsIdx = argv.indexOf('-t');
     const fsType = fsIdx !== -1 ? argv[fsIdx + 1] ?? this.s.fsType : this.s.fsType;
-    const resolved = device === byUuidPath(this.s) ? (this.state.uuidPresent ? this.state.uuidDevice : null) : device;
+
+    if (isBind) {
+      // `mount --bind <umbrelMountPath> <mountPoint>`: our bind of umbreld's mount.
+      // The bind shares the source device of whatever fs backs <umbrelMountPath>.
+      const srcMount = this.liveMountAt(src);
+      const source = srcMount ? srcMount.source : this.state.uuidDevice;
+      this.state.mounts = this.state.mounts.filter((m) => m.target !== target);
+      this.state.mounts.push(this.appBindAt(this.state, source));
+      return true;
+    }
+
+    const resolved =
+      src === byUuidPath(this.s) ? (this.state.uuidPresent ? this.state.uuidDevice : null) : src;
     if (resolved === null || resolved === '') return false;
     this.state.mounts = this.state.mounts.filter((m) => m.target !== target);
-    this.state.mounts.push({ source: resolved, target, fsType, options: ['rw', 'relatime'] });
+    this.state.mounts.push(this.appDirectAt(this.state, resolved));
     return true;
   }
 
@@ -357,6 +876,10 @@ class MockHostAdapterImpl implements MockHostAdapter {
     if (compText) this.state.container.binds = this.bindsFromCompose(compText);
     this.state.container.exists = true;
     this.state.container.running = true;
+    this.state.container.startedAt = new Date().toISOString(); // fresh StartedAt
+    // Docker resolves bind SOURCES at container start: a recreate re-reads the
+    // live backing, so the in-container view now matches host-side reality.
+    this.state.container.view = this.mediaHostVisible() ? Object.keys(this.state.deviceFolders) : [];
   }
 
   async hostname(): Promise<string> {
@@ -370,6 +893,7 @@ class MockHostAdapterImpl implements MockHostAdapter {
       containerName: c.exists ? `${plexAppId}_server_1` : null,
       state: c.exists ? (c.running ? 'running' : 'exited') : null,
       binds: c.binds,
+      startedAt: c.exists ? c.startedAt : null,
     };
   }
 }

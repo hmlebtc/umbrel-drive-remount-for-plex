@@ -1,6 +1,6 @@
 {
   "name": "umbrel-drive-remount-for-plex",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Umbrel app that keeps an external drive mounted for Plex on umbrelOS: a boot hook, a Plex compose patch, a monitor with auto-heal, and a dashboard.",

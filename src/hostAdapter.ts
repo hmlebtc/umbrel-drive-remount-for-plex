@@ -16,7 +16,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { chmod, lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, rename, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 
 import { DockerApi } from './dockerApi.js';
@@ -24,6 +24,8 @@ import type { ContainerBind } from './types.js';
 
 export interface ExecOptions {
   env?: Record<string, string>;
+  /** Per-call timeout override in ms (e.g. the 5s Plex liveness probe). Default 120s. */
+  timeoutMs?: number;
 }
 
 export interface ExecResult {
@@ -37,6 +39,8 @@ export interface PlexInspect {
   containerName: string | null;
   state: string | null;
   binds: ContainerBind[];
+  /** Container State.StartedAt (ISO), for the bind-generation recreate rule (spec section 5). */
+  startedAt: string | null;
 }
 
 export interface HostAdapter {
@@ -54,6 +58,18 @@ export interface HostAdapter {
   realpath(hostPath: string): Promise<string | null>;
   /** Raw text of the host mount table (/proc/1/mounts). */
   readProcMounts(): Promise<string>;
+  /**
+   * Raw text of PID 1's /proc/1/mountinfo (spec section 2): richer than
+   * /proc/1/mounts — carries the per-mount root subtree and mount ids needed to
+   * tell a bind-of-umbrel apart from a direct mount and to pick the newest mount.
+   */
+  readProcMountInfo(): Promise<string>;
+  /**
+   * Remove an EMPTY host directory (spec section 4 reaping). rmdir ONLY — it
+   * MUST fail on a non-empty directory (never recursive) — and a missing target
+   * (ENOENT) is a no-op, not an error.
+   */
+  removeDir(hostPath: string): Promise<void>;
   /** Run a host command (argv array) via nsenter; never rejects on non-zero exit. */
   exec(argv: string[], opts?: ExecOptions): Promise<ExecResult>;
   /** The host's hostname (for DEVICE_HOSTNAME in the compose fallback). */
@@ -64,6 +80,7 @@ export interface HostAdapter {
 
 const HOST_ROOT = '/proc/1/root';
 const HOST_MOUNTS = '/proc/1/mounts';
+const HOST_MOUNTINFO = '/proc/1/mountinfo';
 
 /** Map a host-absolute path to its /proc/1/root view, rejecting traversal. */
 function toHostView(hostPath: string): string {
@@ -151,6 +168,29 @@ export class RealHostAdapter implements HostAdapter {
     }
   }
 
+  async readProcMountInfo(): Promise<string> {
+    try {
+      return await readFile(HOST_MOUNTINFO, 'utf8');
+    } catch {
+      try {
+        return await readFile('/proc/self/mountinfo', 'utf8');
+      } catch {
+        return '';
+      }
+    }
+  }
+
+  async removeDir(hostPath: string): Promise<void> {
+    try {
+      // rmdir (NON-recursive): fails with ENOTEMPTY on a non-empty directory, so
+      // this can never delete a directory that still holds data or a live mount.
+      await rmdir(toHostView(hostPath));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // already gone -> no-op
+      throw err;
+    }
+  }
+
   exec(argv: string[], opts?: ExecOptions): Promise<ExecResult> {
     const nsArgs: string[] = ['-t', '1', '-m', '-u', '-i', '-n', '--'];
     if (opts?.env) {
@@ -165,7 +205,7 @@ export class RealHostAdapter implements HostAdapter {
       execFile(
         'nsenter',
         nsArgs,
-        { maxBuffer: 8 * 1024 * 1024, timeout: 120_000 },
+        { maxBuffer: 8 * 1024 * 1024, timeout: opts?.timeoutMs ?? 120_000 },
         (err, stdout, stderr) => {
           const out = typeof stdout === 'string' ? stdout : String(stdout ?? '');
           const errOut = typeof stderr === 'string' ? stderr : String(stderr ?? '');

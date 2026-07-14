@@ -44,7 +44,7 @@ services:
   web:
     # Pin the exact released version - never `:latest`, never `v`-prefixed.
     # Bump in lockstep with umbrel-app.yml `version:` on every release.
-    image: ghcr.io/hmlebtc/umbrel-drive-remount-for-plex:0.1.2
+    image: ghcr.io/hmlebtc/umbrel-drive-remount-for-plex:0.2.0
     restart: on-failure
     stop_grace_period: 30s
     # See the block comment above: both are required for the host-access
@@ -60,6 +60,12 @@ services:
       DRP_UUID: 555bf6f0-ae17-4137-adec-e91818854f1c
       DRP_FSTYPE: ext4
       DRP_MOUNT_POINT: /mnt/wdexternal
+      # Cooperative mode is opt-in via the dashboard (Settings / "Switch to
+      # cooperative mode") - these two only seed the default, classic
+      # behavior on first boot; changing mode afterwards is a live setting,
+      # not a redeploy.
+      DRP_MOUNT_MODE: "classic"
+      DRP_GRACE_SECONDS: "180"
       DRP_MEDIA_SUBDIR: media
       DRP_FOLDERS: Movies,TVshows,Music
       DRP_PLEX_APP_ID: plex

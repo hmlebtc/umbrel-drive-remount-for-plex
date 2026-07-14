@@ -20,19 +20,45 @@ import {
   hostMediaPath,
   legacyOverridePath,
 } from './paths.js';
-import type { AppStatus, MediaFolderStatus, Settings } from './types.js';
+import { probeLiveOk } from './plex.js';
+import type {
+  AppStatus,
+  BackingStatus,
+  MediaFolderStatus,
+  Settings,
+  WarningCode,
+} from './types.js';
 import { APP_VERSION, GIT_SHA } from './version.js';
 
-/** The single source of truth for "is the whole media path healthy right now". */
+/**
+ * The single source of truth for "is the whole media path healthy right now".
+ *
+ * Mode-aware (spec section 8): classic keeps the v0.1.x criteria byte-for-byte;
+ * cooperative additionally requires the bind to be active on the live umbrelOS
+ * mount. Both gain the in-container liveness gate — a PROBED-dead view
+ * (`plex.liveOk === false`) fails health so Plex is recreated; an unset/true
+ * liveOk never newly fails health (backward compatible).
+ */
 export function isHealthy(s: AppStatus): boolean {
-  return (
-    s.mount.mounted &&
-    !s.mount.stale &&
+  const base =
     s.plex.bindOk &&
     s.bootHook.ok &&
     s.composePatch.ok &&
-    s.media.ok
-  );
+    s.media.ok &&
+    s.plex.liveOk !== false;
+
+  const mode = s.backing?.mode ?? 'classic';
+  if (mode === 'cooperative') {
+    const b = s.backing;
+    const backingHealthy =
+      b.active === 'umbrel-bind' &&
+      b.umbrelMount.found &&
+      b.umbrelMount.readable &&
+      s.mount.mounted &&
+      !s.mount.stale;
+    return base && backingHealthy;
+  }
+  return s.mount.mounted && !s.mount.stale && base;
 }
 
 /**
@@ -83,7 +109,21 @@ async function detectFstabEntry(adapter: HostAdapter, settings: Settings): Promi
   return false;
 }
 
-export async function probeStatus(adapter: HostAdapter, settings: Settings): Promise<AppStatus> {
+/**
+ * Optional precomputed backing (spec section 8). The server and monitor pass the
+ * BackingEngine's authoritative backing + warnings; callers without an engine
+ * (the restore job's internal probes, unit tests) omit it and get a classic
+ * default derived from the plain mount table.
+ */
+export interface ProbeOptions {
+  backing?: { backing: BackingStatus; warnings: WarningCode[] };
+}
+
+export async function probeStatus(
+  adapter: HostAdapter,
+  settings: Settings,
+  opts: ProbeOptions = {},
+): Promise<AppStatus> {
   const timestamp = new Date().toISOString();
 
   // --- Drive presence -------------------------------------------------------
@@ -108,6 +148,7 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
     uuid: settings.uuid,
     mountPoint: settings.mountPoint,
     fsType: settings.fsType,
+    mountMode: settings.mountMode ?? 'classic',
   });
   const hookOk = existingHook !== null && !hookResult.changed;
   const hookProblems = hookOk
@@ -151,6 +192,14 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
       (b) => b.source === wantBindSource && b.destination === settings.containerMediaPath,
     );
 
+  // In-container liveness (spec section 5): distinct from config-level bindOk.
+  // Only probed when Plex is actually running; otherwise `true` so it never
+  // becomes the sole health discriminator (bindOk already covers not-running).
+  const liveOk =
+    inspect.found && inspect.state === 'running' && inspect.containerName !== null
+      ? await probeLiveOk(adapter, settings, inspect.containerName)
+      : true;
+
   // --- Media folders --------------------------------------------------------
   const mediaRoot = hostMediaPath(settings);
   const active = mounted && !stale;
@@ -164,6 +213,24 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
     folders.push({ name, present: folderPresent, entries: list?.length ?? 0 });
   }
   const mediaOk = active && allFoldersPresent;
+
+  // --- Backing + warnings ---------------------------------------------------
+  // Prefer the engine-supplied authoritative backing; otherwise derive a classic
+  // default from the plain mount table (keeps unit tests / the restore job's
+  // internal probes self-contained without an engine).
+  const mode = settings.mountMode ?? 'classic';
+  const defaultBacking: BackingStatus = {
+    mode,
+    active: mounted ? 'direct' : 'none',
+    umbrelMount: { found: false, path: null, readable: false },
+    bindGeneration: 0,
+    lastBindChangeAt: null,
+    reaped: { dirs: 0, mounts: 0 },
+  };
+  const defaultWarnings: WarningCode[] =
+    mode === 'classic' && present && mounted ? ['FORMAT_DIALOG_EXPECTED'] : [];
+  const backing = opts.backing?.backing ?? defaultBacking;
+  const warnings = opts.backing?.warnings ?? defaultWarnings;
 
   return {
     timestamp,
@@ -185,6 +252,8 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
       state: inspect.state,
       bindOk,
       binds: inspect.binds,
+      startedAt: inspect.startedAt,
+      liveOk,
     },
     media: { ok: mediaOk, folders },
     autoHeal: {
@@ -195,5 +264,7 @@ export async function probeStatus(adapter: HostAdapter, settings: Settings): Pro
       suspended: false,
     },
     lastRestore: null,
+    backing,
+    warnings,
   };
 }

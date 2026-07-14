@@ -6,7 +6,7 @@ manifestVersion: 1
 id: hmlebtc-drive-remount-for-plex
 category: files
 name: Drive Remount for Plex
-version: "0.1.2"
+version: "0.2.0"
 tagline: Keep an external drive permanently mounted and bound into Plex
 icon: https://raw.githubusercontent.com/hmlebtc/umbrel-drive-remount-for-plex/main/assets/icon-512.png
 # Umbrel renders the description literally - each paragraph is one physical
@@ -33,6 +33,8 @@ defaultPassword: ""
 submitter: hmlebtc
 submission: https://github.com/hmlebtc/umbrel-drive-remount-for-plex
 releaseNotes: |
+  v0.2.0 adds cooperative mode - the drive can now be used by umbrelOS Files (and its Samba shares) AND Plex simultaneously; the app lets umbrelOS own the mount and keeps Plex on a stable path via a managed bind, self-healing across updates, power loss, USB reconnects, and umbrelOS mount-path changes; guided switch in the dashboard; classic mode remains the default until you switch; also adds a strong warning against umbrelOS's Format prompt while in classic mode.
+
   v0.1.2 adds a one-click "Remove legacy override" button to the dashboard - when a leftover docker-compose.override.yml from a previous manual setup is detected (umbrelOS ignores it), you can now delete it from the UI; it is backed up to the app data directory first. No other behavior changes.
 
   v0.1.1 is a reliability patch - resolves the external drive's device path in the host namespace (fixing reconnect stale-detection and the "no device path" status line), recreates the Plex container directly via docker compose (removing two no-op umbrel CLI attempts that logged confusing errors), and fixes a status label that showed "read-only" when the drive was simply not mounted. No settings or data changes; a straight in-place update.

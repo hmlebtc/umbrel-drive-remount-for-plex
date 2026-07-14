@@ -135,6 +135,11 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
   .banner-body strong { display: block; margin-bottom: 4px; font-size: 15px; }
   .banner-body p { margin: 0 0 10px; color: var(--muted); font-size: 13.5px; }
   .banner-body p:last-child { margin-bottom: 0; }
+  .banner.amber {
+    background: linear-gradient(180deg, rgba(229,160,13,0.16), rgba(229,160,13,0.05));
+    border: 1px solid rgba(229,160,13,0.5);
+    border-left: 4px solid var(--amber);
+  }
 
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -206,12 +211,14 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
   .field-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px 14px; margin-bottom: 12px; }
   .field label, .field > label { font-size: 13px; font-weight: 600; color: var(--text); }
   .lbl-note { font-weight: 400; color: var(--faint); font-size: 12px; }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], select {
     font: inherit; font-size: 14px; width: 100%;
     padding: 8px 11px; border-radius: 9px;
     background: var(--input); border: 1px solid var(--border2); color: var(--text);
   }
-  input:focus { outline: none; border-color: var(--blue2); box-shadow: 0 0 0 3px rgba(59,130,246,0.18); }
+  input:focus, select:focus { outline: none; border-color: var(--blue2); box-shadow: 0 0 0 3px rgba(59,130,246,0.18); }
+  select option { background: var(--input); color: var(--text); }
+  .field-note { font-size: 12px; color: var(--faint); margin-top: 2px; }
   .check { display: flex; align-items: flex-start; gap: 9px; margin: 9px 0 0; font-size: 13.5px; cursor: pointer; color: var(--text); }
   .check input { width: 17px; height: 17px; margin-top: 1px; accent-color: var(--amber); flex: none; }
   .form-foot { display: flex; justify-content: flex-end; margin-top: 4px; }
@@ -277,6 +284,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     </div>
   </section>
 
+  <section id="warningsBanners" style="display:none"></section>
+
   <section class="card" id="statusCard">
     <div class="card-head">
       <h2>Status</h2>
@@ -321,6 +330,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     <div class="actions-row">
       <button class="btn btn-sm danger" id="restoreBtn" type="button">Run full restore</button>
       <button class="btn btn-sm" id="restartPlexBtn" type="button">Restart Plex</button>
+      <button class="btn btn-sm amber" id="switchCoopBtn" type="button" style="display:none">Switch to cooperative mode</button>
+      <button class="btn btn-sm amber" id="switchClassicBtn" type="button" style="display:none">Switch to classic mode</button>
       <button class="btn btn-sm" id="checkNowBtn" type="button">Check now</button>
       <button class="btn btn-sm" id="removeLegacyOverrideBtn" type="button" style="display:none">Remove legacy override</button>
       <label class="autoheal-toggle" for="autoHealToggle"><input id="autoHealToggle" type="checkbox"><span>Auto-heal</span></label>
@@ -396,6 +407,24 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
           <input id="cfg_containerMediaPath" type="text" placeholder="/media/wdexternal" autocomplete="off" spellcheck="false">
           <div class="field-err" id="err_containerMediaPath"></div>
         </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Mount mode</legend>
+        <div class="field">
+          <label for="cfg_mountMode">Mode</label>
+          <select id="cfg_mountMode">
+            <option value="classic">Classic &mdash; direct mount by UUID; umbrelOS Files will show a Format prompt (do not use it)</option>
+            <option value="cooperative">Cooperative &mdash; bind to umbrelOS's own mount so Files, Samba, and Plex all see the drive</option>
+          </select>
+          <div class="field-err" id="err_mountMode"></div>
+        </div>
+        <div class="field">
+          <label for="cfg_graceSec">Grace period <span class="lbl-note">(seconds to wait for umbrelOS to mount before falling back, 60&ndash;900)</span></label>
+          <input id="cfg_graceSec" type="number" min="60" max="900" step="1" inputmode="numeric">
+          <div class="field-err" id="err_graceSec"></div>
+        </div>
+        <div class="field-note">Saving here only updates the stored setting. Use the "Switch to&hellip;" button in Actions to actually migrate the drive safely.</div>
       </fieldset>
 
       <fieldset>
@@ -596,7 +625,26 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     return '<ul class="problems">' + lis + "</ul>";
   }
 
-  function tileSubLines(key, d) {
+  // Shortens an umbrelOS external mount path down to "external/<name>" for
+  // display, per spec section 8's example ("via umbrelOS (external/wdexternal)").
+  function shortUmbrelPath(p) {
+    if (!p) return "";
+    var idx = String(p).indexOf("/external/");
+    return idx !== -1 ? String(p).slice(idx + 1) : String(p);
+  }
+
+  function backingLine(s) {
+    var backing = s && s.backing;
+    if (!backing) return null; // old server without section-8 fields: degrade silently
+    if (backing.active === "umbrel-bind") {
+      var short = shortUmbrelPath(backing.umbrelMount && backing.umbrelMount.path);
+      return "Backing: via umbrelOS" + (short ? ' <span class="mono">(' + esc(short) + ")</span>" : "");
+    }
+    if (backing.active === "direct") return "Backing: direct (classic)";
+    return 'Backing: <span class="warn-t">not backed</span>';
+  }
+
+  function tileSubLines(key, d, s) {
     var lines = [];
     if (key === "drive") {
       if (d.device) lines.push('<span class="mono">' + esc(d.device) + "</span>");
@@ -610,6 +658,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
         if (d.fsType) lines.push("fs: " + esc(d.fsType) + (d.rw === false ? " (read-only)" : ""));
         if (d.stale === true) lines.push('<span class="warn-t">stale mount</span>');
       }
+      var bl = backingLine(s);
+      if (bl) lines.push(bl);
     } else if (key === "bootHook") {
       if (d.path) lines.push('<span class="mono">' + esc(d.path) + "</span>");
       lines.push(problemsHtml(d.problems));
@@ -622,6 +672,7 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       if (d.containerName) lines.push('<span class="mono">' + esc(d.containerName) + "</span>");
       if (d.state) lines.push("state: " + esc(d.state));
       if (d.found) lines.push(d.bindOk ? '<span class="ok small">bind present</span>' : '<span class="warn-t">bind missing</span>');
+      if (d.liveOk != null) lines.push(d.liveOk ? '<span class="ok small">live view: ok</span>' : '<span class="warn-t">live view: stale</span>');
     } else if (key === "media") {
       var folders = d.folders || [];
       if (folders.length) {
@@ -645,7 +696,7 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       var pillEl = $("tp_" + key);
       if (pillEl) { pillEl.className = "tpill " + tilePillClass(state); pillEl.textContent = tilePillLabel(state); }
       setText("tv_" + key, tilePillLabel(state));
-      var lines = tileSubLines(key, d);
+      var lines = tileSubLines(key, d, s);
       setHtml("ts_" + key, lines.length ? lines.join("<br>") : '<span class="muted">no detail reported</span>');
     }
   }
@@ -655,6 +706,59 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       if (tileState(TILE_KEYS[i], s[TILE_KEYS[i]]) === "broken") return true;
     }
     return false;
+  }
+
+  // ---- warnings banner (spec section 8: status.warnings[] + backing) -------
+  // Reads ONLY status.warnings (array of codes) and status.backing; both are
+  // absent on an old server, in which case this renders nothing (graceful
+  // degradation — no section-8 fields assumed present).
+  function renderWarnings(s) {
+    var warnings = (s && s.warnings) || [];
+    var backing = s && s.backing;
+    var items = [];
+
+    if (warnings.indexOf("FORMAT_DIALOG_EXPECTED") !== -1) {
+      items.push({
+        level: "amber",
+        title: "umbrelOS Files may show a Format prompt",
+        body: "umbrelOS Files will show a Format prompt for this drive while it is in classic mode or unmounted — do NOT format; your data is intact."
+      });
+    }
+    if (warnings.indexOf("WAITING_FOR_UMBREL_MOUNT") !== -1) {
+      var grace = backing && backing.graceRemainingSec;
+      var graceTxt = (grace != null) ? (" — about " + fmtInt(Math.max(0, Math.round(grace))) + "s remaining") : "";
+      items.push({
+        level: "amber",
+        title: "Waiting for umbrelOS to mount the drive" + graceTxt,
+        body: "The drive is present but umbrelOS has not mounted it yet. If the grace period elapses without umbrelOS mounting it, the app falls back to a direct mount."
+      });
+    }
+    var ejected = warnings.indexOf("EJECTED_IN_UMBREL") !== -1;
+    if (ejected) {
+      items.push({
+        level: "red",
+        title: "Drive ejected in umbrelOS",
+        body: "The drive was ejected from umbrelOS Files (or umbrelOS restarted) and is not currently backed. It will reconnect automatically once umbrelOS remounts it, or you can unplug and replug the drive."
+      });
+    }
+    if (backing && backing.active === "none" && !ejected) {
+      items.push({
+        level: "red",
+        title: "Drive is not backed",
+        body: "The stable mount point has no active backing right now, so Plex and umbrelOS Files cannot see the drive until this resolves."
+      });
+    }
+
+    show("warningsBanners", items.length > 0);
+    var html = "";
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      html += '<div class="banner' + (it.level === "amber" ? " amber" : "") + '" role="alert">'
+        + '<div class="banner-ic" aria-hidden="true">' + (it.level === "amber" ? "&#9888;&#65039;" : "&#9940;") + "</div>"
+        + '<div class="banner-body"><strong>' + esc(it.title) + "</strong><p>" + esc(it.body) + "</p></div>"
+        + "</div>";
+    }
+    setHtml("warningsBanners", html);
   }
 
   // ---- status render ---------------------------------------------------------
@@ -697,6 +801,18 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     }
 
     renderTiles(s);
+    renderWarnings(s);
+
+    // Switch-mode buttons only make sense once the server reports section-8
+    // backing info (an old server has no /api/switch-mode route to call).
+    var backing = s.backing;
+    if (backing && backing.mode) {
+      show("switchCoopBtn", backing.mode === "classic");
+      show("switchClassicBtn", backing.mode === "cooperative");
+    } else {
+      show("switchCoopBtn", false);
+      show("switchClassicBtn", false);
+    }
   }
 
   // ---- job render --------------------------------------------------------------
@@ -715,7 +831,15 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     recreate: "Recreate Plex container",
     verify: "Verify"
   };
-  function stepLabel(name) { return STEP_LABELS[name] || String(name || "step"); }
+  // Generic fallback for step names not in STEP_LABELS (e.g. new switch-mode
+  // job steps whose exact names aren't frozen by the spec): "reapDirs" ->
+  // "Reap dirs".
+  function prettifyStepName(name) {
+    var s = String(name || "step");
+    s = s.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+  function stepLabel(name) { return STEP_LABELS[name] || prettifyStepName(name); }
 
   function renderJob(job) {
     var card = $("jobCard");
@@ -837,6 +961,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     setV("cfg_plexAppId", c.plexAppId || "");
     setV("cfg_umbrelRoot", c.umbrelRoot || "");
     setV("cfg_containerMediaPath", c.containerMediaPath || "");
+    setV("cfg_mountMode", c.mountMode || "classic");
+    setV("cfg_graceSec", c.graceSec != null ? c.graceSec : 180);
     var ah = c.autoHeal || {};
     setC("cfg_autoHealEnabled", ah.enabled !== false);
     setV("cfg_intervalSec", ah.intervalSec != null ? ah.intervalSec : 30);
@@ -855,6 +981,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       plexAppId: val("cfg_plexAppId").trim(),
       umbrelRoot: val("cfg_umbrelRoot").trim(),
       containerMediaPath: val("cfg_containerMediaPath").trim(),
+      mountMode: val("cfg_mountMode"),
+      graceSec: numVal("cfg_graceSec", 180),
       autoHeal: {
         enabled: checked("cfg_autoHealEnabled"),
         intervalSec: numVal("cfg_intervalSec", 30),
@@ -881,6 +1009,8 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     if (!s.plexAppId) errs.plexAppId = "required";
     if (!isAbsCleanPath(s.umbrelRoot)) errs.umbrelRoot = "must be an absolute path with no spaces, quotes, or backslashes";
     if (!isAbsCleanPath(s.containerMediaPath)) errs.containerMediaPath = "must be an absolute path with no spaces, quotes, or backslashes";
+    if (s.mountMode !== "classic" && s.mountMode !== "cooperative") errs.mountMode = "must be classic or cooperative";
+    if (!(s.graceSec >= 60 && s.graceSec <= 900)) errs.graceSec = "must be between 60 and 900";
     var ah = s.autoHeal || {};
     if (!(ah.intervalSec >= 10 && ah.intervalSec <= 3600)) errs.intervalSec = "must be between 10 and 3600";
     if (!(ah.cooldownSec >= 60 && ah.cooldownSec <= 86400)) errs.cooldownSec = "must be between 60 and 86400";
@@ -969,6 +1099,58 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     else { toast(res.error, "error"); }
     unbusy(btn, old);
     loadStatus();
+  });
+
+  // Spec section 6's migration sequence, spelled out for the confirm dialogs.
+  var SWITCH_TO_COOP_STEPS = [
+    "Save mount mode as cooperative",
+    "Clean up (reap) any leftover directories or dead mounts under umbrelOS's external folder",
+    "Unmount our direct mount of the drive",
+    "Ask umbrelOS to rescan the drive (simulated USB replug)",
+    "Wait for umbrelOS to mount the drive",
+    "Bind our stable mount point to umbrelOS's mount",
+    "Plex will restart once to pick up the new bind",
+    "Verify the drive is healthy and visible in umbrelOS"
+  ];
+  var SWITCH_TO_COOP_NOTE = "If the automatic rescan fails, a status note will ask you to unplug and replug the drive's USB cable — the switch finishes automatically once umbrelOS mounts it.";
+  var SWITCH_TO_CLASSIC_STEPS = [
+    "Save mount mode as classic",
+    "Unmount the umbrelOS-backed bind",
+    "Mount the drive directly by its UUID",
+    "Plex will restart once to pick up the new mount",
+    "umbrelOS Files will show a Format prompt for this drive while classic mode is active — do NOT format; your data is intact"
+  ];
+
+  function confirmSwitch(steps, note, targetLabel) {
+    var lines = ["This will switch to " + targetLabel + " mode:"];
+    for (var i = 0; i < steps.length; i++) lines.push((i + 1) + ". " + steps[i]);
+    if (note) { lines.push(""); lines.push(note); }
+    lines.push("");
+    lines.push("Continue?");
+    return window.confirm(lines.join("\n"));
+  }
+
+  async function doSwitchMode(mode) {
+    var res = await apiPost("/api/switch-mode", { mode: mode, confirm: true });
+    if (res.ok) { toast("Switching to " + mode + " mode", "ok"); jobRunning = true; setJobPollRate(1000); loadJob(); }
+    else { toast(res.error, "error"); }
+    loadStatus();
+  }
+
+  $("switchCoopBtn").addEventListener("click", async function () {
+    if (!confirmSwitch(SWITCH_TO_COOP_STEPS, SWITCH_TO_COOP_NOTE, "cooperative")) return;
+    var btn = this;
+    var old = busy(btn, "Switching…");
+    await doSwitchMode("cooperative");
+    unbusy(btn, old);
+  });
+
+  $("switchClassicBtn").addEventListener("click", async function () {
+    if (!confirmSwitch(SWITCH_TO_CLASSIC_STEPS, null, "classic")) return;
+    var btn = this;
+    var old = busy(btn, "Switching…");
+    await doSwitchMode("classic");
+    unbusy(btn, old);
   });
 
   $("checkNowBtn").addEventListener("click", async function () {

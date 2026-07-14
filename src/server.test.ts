@@ -174,6 +174,12 @@ class GatedFirstExistsAdapter implements HostAdapter {
   readProcMounts(): Promise<string> {
     return this.base.readProcMounts();
   }
+  readProcMountInfo(): Promise<string> {
+    return this.base.readProcMountInfo();
+  }
+  removeDir(hostPath: string): Promise<void> {
+    return this.base.removeDir(hostPath);
+  }
   exec(argv: string[], opts?: ExecOptions): Promise<ExecResult> {
     return this.base.exec(argv, opts);
   }
@@ -486,5 +492,77 @@ test("GET /healthz: 200", async () => {
     });
   } finally {
     cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/switch-mode (spec section 6): enum validation, confirm gate, and a
+// 409 while any single-flight job is running.
+// ---------------------------------------------------------------------------
+
+test("POST /api/switch-mode: an invalid mode -> 400 (enum validation)", async () => {
+  const { ctx, cleanup } = buildCtx();
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      const { status, body } = await postJSON(baseUrl, "/api/switch-mode", { mode: "sideways", confirm: true });
+      assert.equal(status, 400);
+      assert.equal(body.ok, false);
+      assert.equal(typeof body.error, "string");
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("POST /api/switch-mode: without confirm:true -> 400 (confirm gate)", async () => {
+  const { ctx, cleanup } = buildCtx();
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      const { status, body } = await postJSON(baseUrl, "/api/switch-mode", { mode: "cooperative" });
+      assert.equal(status, 400);
+      assert.equal(body.ok, false);
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("POST /api/switch-mode: a valid request while a job is running -> 409 (shared single-flight lock)", async () => {
+  // Hold a restore job IN-FLIGHT on the gate (same deterministic technique as the
+  // restore 409 test), then prove switch-mode observes the running job and 409s.
+  const dir = mkdtempSync(join(tmpdir(), "drp-server-"));
+  const settings = new SettingsStore(dir, defaultSettings());
+  const gate = deferred<void>();
+  const entered = deferred<void>();
+  const adapter = new GatedFirstExistsAdapter(
+    createMockAdapter("healthy"),
+    gate.promise,
+    () => entered.resolve(),
+  );
+  const restore = createRestoreRunner(adapter, () => settings.get());
+  const ctx: AppContext = {
+    adapter,
+    settings,
+    restore,
+    mock: true,
+    startedAt: new Date().toISOString(),
+    version: "0.1.0",
+    gitSha: "test-sha",
+  };
+  try {
+    await withServer(ctx, async (baseUrl) => {
+      const p1 = postJSON(baseUrl, "/api/restore", { confirm: true });
+      await entered.promise; // restore is now deterministically running:true
+
+      const switchRes = await postJSON(baseUrl, "/api/switch-mode", { mode: "cooperative", confirm: true });
+      assert.equal(switchRes.status, 409, "a switch while a job runs must 409");
+      assert.equal(switchRes.body.ok, false);
+      assert.equal(typeof switchRes.body.error, "string");
+
+      gate.resolve();
+      await p1;
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

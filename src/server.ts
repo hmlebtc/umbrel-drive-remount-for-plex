@@ -9,6 +9,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
+import type { BackingEngine } from './backingEngine.js';
 import { DASHBOARD_HTML, FAVICON_SVG } from './dashboard.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
@@ -17,7 +18,7 @@ import type { Monitor } from './monitor.js';
 import type { RestoreRunner } from './restore.js';
 import type { SettingsStore } from './settings.js';
 import { probeStatus } from './status.js';
-import type { AppStatus, RestoreJob, RestoreSummary, Settings } from './types.js';
+import type { AppStatus, MountMode, RestoreJob, RestoreSummary, Settings } from './types.js';
 
 const BODY_LIMIT = 64 * 1024;
 
@@ -31,6 +32,8 @@ export interface AppContext {
   gitSha: string;
   monitor?: Monitor;
   events?: EventLog;
+  /** Cooperative backing engine (spec sections 3-8); absent in classic-only tests. */
+  backing?: BackingEngine;
   /** App /data dir; where legacy-override backups are written (backups.ts). */
   dataDir?: string;
 }
@@ -124,7 +127,11 @@ function summarizeJob(job: RestoreJob | null): RestoreSummary | null {
 
 async function buildStatus(ctx: AppContext): Promise<AppStatus> {
   const settings = ctx.settings.get();
-  const status = await probeStatus(ctx.adapter, settings);
+  const status = await probeStatus(
+    ctx.adapter,
+    settings,
+    ctx.backing ? { backing: await ctx.backing.backingStatus(settings) } : {},
+  );
   status.version = ctx.version;
   status.gitSha = ctx.gitSha;
   status.autoHeal = ctx.monitor
@@ -211,6 +218,25 @@ async function handleMockScenario(ctx: AppContext, req: IncomingMessage, res: Se
   return ok(res, { scenario });
 }
 
+async function handleSwitchMode(ctx: AppContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readBody(req);
+  if (body.tooLarge) return fail(res, 413, 'request body too large');
+  if (!body.ok) return fail(res, 400, 'could not read request body');
+  const parsed = parseJson(body.text);
+  if (!parsed.ok) return fail(res, 400, 'invalid JSON body');
+  const mode = parsed.value.mode;
+  if (mode !== 'cooperative' && mode !== 'classic') {
+    return fail(res, 400, 'mode must be "cooperative" or "classic"');
+  }
+  if (parsed.value.confirm !== true) {
+    return fail(res, 400, 'confirmation required: send {"confirm": true}');
+  }
+  const started = ctx.restore.startSwitch(mode as MountMode);
+  if (!started.ok) return fail(res, 409, started.error);
+  ctx.events?.info('switch', `switch to ${mode} requested via API`);
+  return ok(res, { jobId: started.jobId });
+}
+
 async function handleRemoveLegacyOverride(
   ctx: AppContext,
   req: IncomingMessage,
@@ -261,6 +287,7 @@ async function route(ctx: AppContext, req: IncomingMessage, res: ServerResponse)
   if (method === 'POST' && path === '/api/restore') return handleRestore(ctx, req, res, 'manual');
   if (method === 'POST' && path === '/api/restart-plex') return handleRestore(ctx, req, res, 'restart-plex');
   if (method === 'POST' && path === '/api/auto-heal') return handleAutoHeal(ctx, req, res);
+  if (method === 'POST' && path === '/api/switch-mode') return handleSwitchMode(ctx, req, res);
   if (method === 'POST' && path === '/api/remove-legacy-override') return handleRemoveLegacyOverride(ctx, req, res);
   if (method === 'POST' && path === '/api/reset-failures') {
     ctx.monitor?.resetFailures();

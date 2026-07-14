@@ -36,35 +36,159 @@ every start, the fixes it applies keep re-applying themselves. The only artifact
 host, outside the container, is the boot-time mount - and umbrelOS has an officially supported,
 update-persistent hook for exactly that.
 
+Since v0.2.0 there are two mount modes, chosen by the `mountMode` setting (`classic`, the default, or
+`cooperative`); the numbered list below describes the shared machinery, and the boot hook step is mode-aware
+as noted. See [Using the drive with umbrelOS Files (cooperative mode)](#using-the-drive-with-umbrelos-files-cooperative-mode)
+for what changes in cooperative mode and why you'd want it.
+
 1. **Boot hook** (`<UMBREL_ROOT>/custom-hooks/pre-start`) - umbrelOS runs this script on every boot, after
    `local-fs.target`/`network-online.target` and before `umbreld` itself starts (via the
    `umbrel-custom-pre-start.service` unit, 5-minute timeout, must be executable). Because it lives on the
    persistent partition, it survives OS updates the way `/etc/fstab` never could. The app manages a single
-   marked block inside this file (`# BEGIN drive-remount-for-plex` / `# END`) that mounts the drive by
-   filesystem UUID - foreign content in the file is always preserved, never overwritten. The hook waits up
-   to ~30 seconds for the drive to enumerate under `/dev/disk/by-uuid` (USB udev settle), then makes one
-   best-effort mount attempt (`mount ... || true`); it never blocks or fails boot, and if the drive still
-   isn't up by then, the app's own monitor (below) picks up the still-unmounted drive on one of its first
-   checks after the container starts and mounts it then.
+   marked block inside this file (`# BEGIN drive-remount-for-plex` / `# END`) that is re-rendered whenever
+   the mode changes. In **classic mode** the block is unchanged from v0.1.x: it waits up to ~30 seconds for
+   the drive to enumerate under `/dev/disk/by-uuid` (USB udev settle), then makes one best-effort direct
+   mount attempt by filesystem UUID (`mount ... || true`). In **cooperative mode** the block only creates
+   the mount point directory (`mkdir -p <mountPoint>`) and deliberately does *not* mount the raw device at
+   boot - doing so would make umbrelOS's own auto-mounter skip the drive at its boot-time scan (see the
+   cooperative-mode section below), which would defeat the whole point of the mode. Either way, foreign
+   content in the file is always preserved, never overwritten, and the hook never blocks or fails boot; if
+   the drive (classic) or umbrelOS's own mount (cooperative) still isn't up once the container starts, the
+   app's own monitor picks up from there.
 2. **Compose patch** (`<UMBREL_ROOT>/app-data/<plexAppId>/docker-compose.yml`) - the app inserts one volume
    line into Plex's *installed* compose file, not the pristine store copy. This works, where an override
    wouldn't, because umbreld's `patchComposeFile()` re-serializes and force-injects `container_name` into
    this exact file on every install/update/start, and its YAML round-trip preserves extra volume entries -
    so umbreld's own restart of Plex keeps the bind. Only a Plex *app update* re-copies the pristine file and
-   drops the patch; the monitor (below) detects that and re-heals it.
-3. **The mount itself** - `mount -t <fsType> /dev/disk/by-uuid/<uuid> <mountPoint>`, run at runtime through
-   `nsenter` for on-demand healing (the boot hook covers the reboot case). The app never touches
-   `/etc/fstab`; if it finds a legacy fstab entry for the same drive, it reports it informationally and
-   leaves it alone.
+   drops the patch; the monitor (below) detects that and re-heals it. This volume line is identical in both
+   modes - it always points at the same stable `<mountPoint>`, regardless of what backs that path.
+3. **The mount itself** - in classic mode, `mount -t <fsType> /dev/disk/by-uuid/<uuid> <mountPoint>`, run at
+   runtime through `nsenter` for on-demand healing (the boot hook covers the reboot case). In cooperative
+   mode this step is replaced by a small state machine (the "backing ladder") that binds `<mountPoint>` to
+   umbrelOS's own live mount instead of mounting the raw device directly - see the cooperative-mode section
+   below for how it works. The app never touches `/etc/fstab` in either mode; if it finds a legacy fstab
+   entry for the same drive, it reports it informationally and leaves it alone.
 4. **Monitor + auto-heal** - a background loop (default every 30s) checks all of the above plus the running
    Plex container's actual bind (via the Docker Engine API) and the media folders' presence, and can
    trigger a full restore automatically when something's broken, debounced against transient states and
    rate-limited by a cooldown. It only recreates the Plex container when the container is actually missing
    the bind - a drifted hook or compose patch on an otherwise healthy, already-bound Plex is repaired
-   silently, with zero Plex downtime.
-5. **Dashboard** - status tiles for each of the six checks above, one-click "Run Full Restore" and "Restart
+   silently, with zero Plex downtime. In cooperative mode the same loop also drives the backing ladder and
+   checks Plex's *in-container* liveness (whether the media folder actually lists inside the running
+   container), not just its config-level bind, since Docker only resolves a bind's source at container
+   start - a re-point of the bind after Plex is already running needs that extra check to catch.
+5. **Dashboard** - status tiles for each of the checks above, one-click "Run Full Restore" and "Restart
    Plex", a live job log, activity history, and a settings form - all behind Umbrel's own session login via
-   `app_proxy`.
+   `app_proxy`. Cooperative mode adds a "Backing" detail to the mount tile and "Switch to cooperative
+   mode" / "Switch to classic mode" actions - see below.
+
+## Using the drive with umbrelOS Files (cooperative mode)
+
+### Why umbrelOS Files shows "Format Required" in classic mode
+
+In classic mode (the default, and the only mode before v0.2.0) this app mounts the drive directly by
+filesystem UUID at `<mountPoint>`, outside of anywhere umbrelOS's own Files app looks. That makes umbrelOS's
+Files app show a **"Format Required"** prompt for the drive, even though it's mounted, healthy, and actively
+serving Plex. This is cosmetic, not a sign of a problem, and it comes from two specific things in umbrelOS
+itself (`getumbrel/umbrel`, verified against `master` and a live box):
+
+- The Files UI decides whether to show the Format prompt with `requiresFormat = !drive.isMounted`
+  (`format-drive-dialog/index.tsx`). `isMounted` is true **only** when umbrelOS's own auto-mounter has
+  mounted the partition under `<UMBREL_ROOT>/external/` (`external-storage.ts`) - it is not a real
+  filesystem probe, so it has no way to know the drive is actually mounted somewhere else.
+- umbrelOS's auto-mounter, in turn, explicitly **skips** any partition that already has a mount anywhere on
+  the system (`if (partition.mountpoints.length > 0) continue`, `external-storage.ts`) - it only scans
+  `lsblk` output for mountpoints, it doesn't check where they are. So the moment this app mounts the drive
+  directly for Plex, umbrelOS's auto-mounter permanently skips it too, and the Files UI is stuck showing
+  "Format Required" for as long as the drive stays in classic mode.
+
+> **Do not click "Format" on this drive in the umbrelOS Files app.** Your data is intact - Plex is reading
+> it right now. umbrelOS's Format action is a real, destructive `sgdisk --zap-all` + `wipefs -a` +
+> repartition + `mkfs`, and it is the *only* thing on umbrelOS that can actually destroy the data on this
+> drive. This app never triggers it, and never will; it exists purely as a manual, user-clicked action
+> inside umbrelOS's own dialog. If you want the "Format Required" prompt gone instead of just ignored,
+> switch to cooperative mode below - do not use the Format button to try to fix it.
+
+The app shows the same warning on the dashboard whenever it detects this situation (the `FORMAT_DIALOG_EXPECTED`
+status warning), as a standing reminder for as long as you stay in classic mode.
+
+### What cooperative mode does
+
+Cooperative mode (`mountMode: "cooperative"`) flips who owns the "real" mount: instead of this app mounting
+the raw device directly, it lets **umbrelOS's own auto-mounter** mount the drive under
+`<UMBREL_ROOT>/external/<label>` (the same mount Files and Samba use), and then binds the app's stable
+`<mountPoint>` - the one path Plex is always configured against - on top of that live mount
+(`mount --bind <umbrelMount> <mountPoint>`). Because umbrelOS now holds the only real mount, its auto-mounter
+no longer skips the drive, and the Files "Format Required" prompt goes away; Files, Samba, and Plex all read
+the same drive at the same time.
+
+Keeping that bind correct across USB reconnects, umbrelOS updates that move the mount path, power loss, and
+umbrelOS's own `" (2)"` name-collision drift is handled by a small state machine (the "backing ladder") that
+the monitor runs on every check, in addition to the existing checks:
+
+- **umbrelOS's mount is present and healthy** -> ensure `<mountPoint>` is bound to exactly that path;
+  re-bind if it's missing, stale, or pointing at the wrong place.
+- **umbrelOS hasn't mounted it yet** -> wait, up to a grace period (default 180 seconds, configurable
+  60-900s via the `graceSec` setting), while reaping stale leftovers (below) so umbrelOS can claim the clean
+  name instead of drifting to `<label> (2)`.
+- **umbrelOS still hasn't mounted it after the grace period** -> fall back to a classic direct mount so
+  Plex is never left without media. This fallback is sticky: the app won't keep retrying automatically, only
+  on the next drive (re)connection or an explicit user action, to avoid flapping.
+- **umbrelOS's mount appears later, while the app is on the fallback** -> switch over to the bind at the
+  next safe point (a drive reconnect, an explicit user action, or a moment when the Plex container isn't
+  running), rather than disrupting Plex mid-stream.
+- **umbrelOS's mount disappears while the drive is still physically present** (typically: you clicked
+  "Eject" in Files, or umbreld itself restarted) -> release the bind and report it (the `EJECTED_IN_UMBREL`
+  status warning) rather than silently falling back to a classic mount, since that could fight a deliberate
+  eject; if umbreld was simply restarting, its mount reappears and the app re-binds automatically.
+
+Alongside the ladder, the app also **reaps** stale entries under `<UMBREL_ROOT>/external/` that match this
+drive's mount label (or umbrelOS's `<label> (2)`, `<label> (3)`, ... collision names): empty leftover
+directories with nothing mounted on them, and dead mounts left behind by a device that's since gone away
+(a stale mount from before a USB reconnect, for example). This is what keeps umbrelOS able to reuse the
+clean, un-suffixed name on remount instead of drifting further with every reconnect. Reaping never touches
+non-empty directories, other drives' folders, or any live mount it doesn't recognize as its own.
+
+### Switching modes
+
+Classic mode remains the default after upgrading to v0.2.0 - nothing changes until you explicitly switch.
+To turn cooperative mode on, use the **"Switch to cooperative mode"** action on the dashboard. It's a
+danger-lite, confirm-first action (the confirmation dialog spells out that Plex will restart once) that runs
+as a single logged job, the same way "Run Full Restore" does:
+
+1. Saves the `cooperative` mode setting.
+2. Reaps stale leftovers under umbrelOS's external-storage folder.
+3. Unmounts the app's own direct mount of the drive at `<mountPoint>`.
+4. Tries to force umbrelOS to notice the drive: since umbrelOS's auto-mounter only scans when it sees a
+   device-connect event (there's no periodic rescan), the app synthesizes one by toggling the drive's USB
+   port authorization off and back on at the kernel level (`sysfs`) - safe to do at this point because the
+   drive was just unmounted in the previous step.
+5. Waits (up to the grace period) for umbrelOS's own mount to appear.
+6. Binds `<mountPoint>` to it.
+7. Restarts Plex once, so it picks up the newly-bound path (Docker only resolves a bind's source when a
+   container starts).
+8. Verifies everything is healthy and that umbrelOS can now see the mount, and reports the result.
+
+**If the automatic USB replug (step 4) doesn't work** - some environments don't expose the USB
+authorization toggle - the dashboard tells you to physically unplug and reconnect the drive's USB cable
+yourself; once umbrelOS notices it and mounts it, the monitor completes the switch (the bind step)
+automatically on its own next check, with no further action needed.
+
+**If any step of the switch fails**, the app automatically reverts to a classic direct mount by UUID so
+Plex is never left without its media, reports exactly why on the dashboard, and leaves the mode setting on
+`cooperative` so it will keep trying to bind on the next safe opportunity rather than silently staying on
+the fallback forever.
+
+**"Switch to classic mode"** reverses the process: unmounts the bind, mounts the drive directly by UUID,
+and reminds you that the Files "Format Required" prompt will come back (see above - it's safe to ignore).
+
+### Cooperative mode is opt-in and comes with a caveat
+
+`mountMode` defaults to `classic` on both fresh installs and upgrades from v0.1.x - the mount behavior of an
+existing installation never changes on its own. Cooperative mode depends on umbrelOS's own auto-mounter
+behavior (undocumented, version-specific internals of `getumbrel/umbrel`, not a public API this app
+controls), so if a future umbrelOS release changes how or where it auto-mounts drives, cooperative mode may
+need an app update to keep working; classic mode has no such dependency and will keep working regardless.
 
 ## Privileged access
 
@@ -131,6 +255,8 @@ env vars in `docker-compose.yml` only *seed* `settings.json` the first time the 
 | Drive UUID | `uuid` | `DRP_UUID` | `555bf6f0-ae17-4137-adec-e91818854f1c` |
 | Filesystem type | `fsType` | `DRP_FSTYPE` | `ext4` |
 | Mount point | `mountPoint` | `DRP_MOUNT_POINT` | `/mnt/wdexternal` |
+| Mount mode | `mountMode` | `DRP_MOUNT_MODE` | `classic` (`classic` or `cooperative`) |
+| Grace period before falling back to classic (s) | `graceSec` | `DRP_GRACE_SECONDS` | `180` (clamped 60-900) |
 | Media subdirectory | `mediaSubdir` | `DRP_MEDIA_SUBDIR` | `media` |
 | Folders | `folders` | `DRP_FOLDERS` (comma-separated) | `Movies,TVshows,Music` |
 | Plex app id | `plexAppId` | `DRP_PLEX_APP_ID` | `plex` |

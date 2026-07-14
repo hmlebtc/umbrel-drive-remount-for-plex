@@ -18,6 +18,8 @@
  * unref()'d timer so it never keeps the process alive on shutdown.
  */
 
+import type { BackingEngine } from './backingEngine.js';
+import { plexNeedsRecreate } from './backingEngine.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
 import { isHealthy, probeStatus } from './status.js';
@@ -26,8 +28,8 @@ import type {
   AutoHealStatus,
   Decision,
   MonitorHistory,
-  RestoreJob,
   Settings,
+  RestoreJob,
 } from './types.js';
 import type { RestoreRunner } from './restore.js';
 
@@ -143,6 +145,8 @@ export interface MonitorDeps {
   getSettings: () => Settings;
   restore: RestoreRunner;
   events?: EventLog;
+  /** Present iff cooperative backing is available; classic mode never uses it. */
+  backing?: BackingEngine;
 }
 
 export class Monitor {
@@ -218,6 +222,14 @@ export class Monitor {
     try {
       const settings = this.deps.getSettings();
       if (!settings.autoHeal.enabled) return;
+
+      // Cooperative mode consults the backing ladder instead of the classic
+      // decide()/restore auto-heal path (spec section 3). Classic mode below is
+      // preserved byte-for-byte.
+      if ((settings.mountMode ?? 'classic') === 'cooperative' && this.deps.backing) {
+        await this.tickCooperative(settings);
+        return;
+      }
 
       let status: AppStatus;
       try {
@@ -300,6 +312,78 @@ export class Monitor {
       }
     } finally {
       this.ticking = false;
+    }
+  }
+
+  /**
+   * One cooperative backing tick (spec sections 3, 5): consult the A-E ladder,
+   * apply the action with the section-10 rails, and recreate Plex on a bind
+   * change or the bind-generation / liveness rule. Guarded by the same
+   * single-flight restore lock so it never races a switch/restore job.
+   */
+  private async tickCooperative(settings: Settings): Promise<void> {
+    if (this.deps.restore.isRunning()) return;
+    const backing = this.deps.backing!;
+    const log = (line: string): void => this.deps.events?.info('backing', line);
+
+    let evalRes;
+    try {
+      evalRes = await backing.evaluate(settings);
+    } catch (e) {
+      this.deps.events?.error('monitor', `backing evaluate failed: ${errMsg(e)}`);
+      return;
+    }
+    this.lastCheckAt = new Date().toISOString();
+    const { view, decision } = evalRes;
+
+    let changed = false;
+    try {
+      switch (decision.action) {
+        case 'wait':
+          this.deps.events?.info('monitor', `backing: ${decision.reason}`);
+          // Reap leftover/dead dirs so umbreld can reuse the clean name.
+          await backing.reap(settings, log);
+          break;
+        case 'bind':
+        case 'handover':
+          this.deps.events?.info('monitor', `backing: ${decision.reason}`);
+          if (view.umbrelMount.path !== null) {
+            changed = await backing.doBind(view.umbrelMount.path, view, settings, log);
+          }
+          break;
+        case 'direct-mount':
+          this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
+          changed = await backing.doDirectMount(view, settings, log);
+          break;
+        case 'release':
+          this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
+          await backing.doRelease(view, settings, log);
+          break;
+        case 'none':
+          break;
+      }
+
+      if (changed) {
+        this.lastActionAt = new Date().toISOString();
+        await backing.recreate(settings, log);
+        return;
+      }
+
+      // No bind change this tick: apply the Plex-liveness / bind-generation
+      // recreate rule (never after a release — there is nothing to point at).
+      if (decision.action !== 'release') {
+        const status = await probeStatus(this.deps.adapter, settings, {
+          backing: await backing.backingStatus(settings),
+        });
+        const need = plexNeedsRecreate(status, backing.getRecord());
+        if (need.recreate) {
+          this.deps.events?.info('monitor', `recreating Plex: ${need.reason}`);
+          this.lastActionAt = new Date().toISOString();
+          await backing.recreate(settings, log);
+        }
+      }
+    } catch (e) {
+      this.deps.events?.error('monitor', `backing tick failed: ${errMsg(e)}`);
     }
   }
 

@@ -4,6 +4,7 @@
  * shuts down cleanly on SIGTERM/SIGINT (docker stop sends SIGTERM).
  */
 
+import { BackingEngine } from './backingEngine.js';
 import { EventLog } from './events.js';
 import { createRealAdapter, type HostAdapter } from './hostAdapter.js';
 import { log, logError } from './log.js';
@@ -26,8 +27,15 @@ function main(): void {
     ? createMockAdapter((process.env.MOCK_SCENARIO as MockScenario) || 'healthy')
     : createRealAdapter();
 
-  const restore = createRestoreRunner(adapter, () => settings.get(), events, dataDir);
-  const monitor = new Monitor({ adapter, getSettings: () => settings.get(), restore, events });
+  const backing = new BackingEngine(adapter, () => settings.get(), events, dataDir);
+  const monitorRef: { current?: Monitor } = {};
+  const restore = createRestoreRunner(adapter, () => settings.get(), events, dataDir, {
+    backing,
+    settings,
+    onModeChange: () => monitorRef.current?.reschedule(),
+  });
+  const monitor = new Monitor({ adapter, getSettings: () => settings.get(), restore, events, backing });
+  monitorRef.current = monitor;
 
   const ctx: AppContext = {
     adapter,
@@ -39,6 +47,7 @@ function main(): void {
     gitSha: GIT_SHA,
     monitor,
     events,
+    backing,
     dataDir,
   };
 
