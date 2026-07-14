@@ -135,11 +135,13 @@ test('switch->cooperative: a recreate failure reverts to a direct mount (Plex ne
 });
 
 // ---------------------------------------------------------------------------
-// Replug-unavailable — the sysfs replug cannot be synthesized; the job finishes
-// with a manual unplug/replug instruction and defers bind/recreate to the monitor.
+// Replug-unavailable — the sysfs replug cannot be synthesized. F10: the job must
+// NOT report success while /mnt/wdexternal is unmounted; it re-mounts DIRECTLY by
+// UUID so Plex keeps serving (mode stays cooperative; the monitor hands over via
+// ladder A once the user replugs). The umbrelOS bind stays deferred.
 // ---------------------------------------------------------------------------
 
-test('switch->cooperative: sysfs replug unavailable -> ends with a manual replug instruction', async () => {
+test('switch->cooperative: sysfs replug unavailable -> direct-mounts so Plex keeps serving + manual replug instruction (F10)', async () => {
   const h = harness('healthy');
   try {
     h.adapter.setReplugAvailable(false); // no USB `authorized` dir -> manual replug
@@ -151,13 +153,19 @@ test('switch->cooperative: sysfs replug unavailable -> ends with a manual replug
     assert.equal(step(job, 'unmount'), 'ok');
     assert.equal(step(job, 'rescan'), 'ok');
     assert.equal(step(job, 'wait-umbrel'), 'ok');
-    // bind + recreate are DEFERRED (the monitor finishes them once the user replugs).
+    // The umbrelOS BIND stays deferred to the monitor (once the user replugs)...
     assert.equal(step(job, 'bind'), 'skipped');
-    assert.equal(step(job, 'recreate'), 'skipped');
+    // ...but Plex is kept serving via a direct mount, so recreate + verify are OK.
+    assert.equal(step(job, 'recreate'), 'ok', 'Plex is recreated onto the direct mount so it is not dark');
     assert.equal(step(job, 'verify'), 'ok');
     assert.match(job.result as string, /unplug and replug/i);
+    assert.match(job.result as string, /direct mount/i);
 
     assert.equal(h.store.get().mountMode, 'cooperative', 'mode still switched to cooperative');
+    // F10: the stable path is NOT left unmounted — Plex has a working backing.
+    assert.equal(h.backing.getRecord().active, 'direct', 'backing is a direct mount (not "none"/dark)');
+    const live = await h.backing.deviceLiveMounts(h.store.get());
+    assert.ok(live.includes('/mnt/wdexternal'), 'the stable path is mounted (Plex keeps serving)');
   } finally {
     h.cleanup();
   }
@@ -196,6 +204,52 @@ test('switch: startSwitch is rejected while a job is already running (shared loc
     assert.equal(first.ok, true);
     assert.equal(second.ok, false);
     if (!second.ok) assert.ok(second.error.length > 0);
+    await waitJob(h.restore);
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F4: the cooperative monitor mutation participates in the SAME single-flight
+// lock as restore/switch. While a coop mutation holds it, a switch/restore is
+// rejected; while a job holds it, a coop mutation does not run. So the two can
+// never interleave backing.json / mount writes.
+// ---------------------------------------------------------------------------
+
+test('F4: a coop mutation and a switch/restore job are mutually exclusive (shared lock)', async () => {
+  const h = harness('coopHealthy');
+  try {
+    // Hold the coop lock across an await we control.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let insideStartSwitch: ReturnType<typeof h.restore.startSwitch> | undefined;
+    let insideStart: ReturnType<typeof h.restore.start> | undefined;
+
+    const held = h.restore.withCoopLock(async () => {
+      // The shared lock reads as running to everyone else.
+      assert.equal(h.restore.isRunning(), true, 'coop lock makes isRunning() true');
+      // A switch and a restore attempted mid-mutation are both rejected.
+      insideStartSwitch = h.restore.startSwitch('classic');
+      insideStart = h.restore.start('auto');
+      await gate;
+      return 'done';
+    });
+
+    // Let the withCoopLock body run up to the await.
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(insideStartSwitch?.ok, false, 'switch rejected while a coop mutation holds the lock');
+    assert.equal(insideStart?.ok, false, 'restore rejected while a coop mutation holds the lock');
+
+    release();
+    const outcome = await held;
+    assert.deepEqual(outcome, { ran: true, value: 'done' });
+    assert.equal(h.restore.isRunning(), false, 'lock released');
+
+    // Conversely: while a switch job runs, a coop mutation does not run.
+    h.restore.startSwitch('classic');
+    const blocked = await h.restore.withCoopLock(async () => 'should-not-run');
+    assert.deepEqual(blocked, { ran: false }, 'coop mutation is skipped while a job holds the lock');
     await waitJob(h.restore);
   } finally {
     h.cleanup();

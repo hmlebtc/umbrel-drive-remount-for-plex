@@ -613,7 +613,11 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     if (key === "plex") {
       if (d.found == null) return "unknown";
       if (!d.found) return "broken";
-      return (d.bindOk && d.state === "running") ? "ok" : "broken";
+      // F9: a running, bound container whose IN-CONTAINER view is dead
+      // (liveOk===false) is broken — media is dark even though the bind looks
+      // correct. This keeps the header pill / overallDegraded() in agreement
+      // with isHealthy() (which also fails on liveOk===false).
+      return (d.bindOk && d.state === "running" && d.liveOk !== false) ? "ok" : "broken";
     }
     return "unknown";
   }

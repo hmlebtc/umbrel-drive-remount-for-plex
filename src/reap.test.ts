@@ -1,27 +1,36 @@
 // Tests for reap.ts (spec section 4: reaping & hygiene under <externalBase>).
-// reap.ts is B1's file, built in parallel; written against the FROZEN signature:
 //
 //   export function reapPlan(
-//     listing: { name: string; empty: boolean; mounted: boolean; dead: boolean }[],
+//     listing: { name; empty; mounted; source; sourcePresent }[],
 //     label: string,
 //   ): { rmdirs: string[]; lazyUmounts: string[] };
 //
 // Spec §4 rules the plan must encode, and NOTHING beyond:
 //   * Only names matching the sanitized label EXACTLY, or "<label> (N)".
 //   * rmdir EMPTY dirs with NO mount (the leftover-dir case).
-//   * `umount -l` DEAD mounts of our former device, THEN rmdir the now-empty dir.
-//   * NEVER touch: non-empty dirs, foreign labels, or LIVE mounts that are not
-//     dead (e.g. umbreld's current /External mount).
+//   * `umount -l` ZOMBIE mounts (F1: SOURCE DEVICE ABSENT), THEN rmdir the empty dir.
+//   * NEVER touch: non-empty dirs, foreign labels, or LIVE mounts (F1: source
+//     device present — foreign, ours, OR ours under a transient EIO).
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { reapPlan } from './reap.js';
+import { reapPlan, type ReapEntry } from './reap.js';
 
+// The `dead` shorthand maps to F1's source-presence fact: a "dead" mount is one
+// whose SOURCE DEVICE is gone (sourcePresent:false); a live mount keeps its
+// source present (sourcePresent:true).
 type Entry = { name: string; empty: boolean; mounted: boolean; dead: boolean };
 
-function entry(name: string, o: Partial<Entry> = {}): Entry {
-  return { name, empty: false, mounted: false, dead: false, ...o };
+function entry(name: string, o: Partial<Entry> = {}): ReapEntry {
+  const e = { name, empty: false, mounted: false, dead: false, ...o };
+  return {
+    name: e.name,
+    empty: e.empty,
+    mounted: e.mounted,
+    source: e.mounted ? '/dev/sdX1' : null,
+    sourcePresent: e.mounted ? !e.dead : false,
+  };
 }
 
 const LABEL = 'wdexternal';
@@ -106,4 +115,50 @@ test('reapPlan: empty listing -> empty plan', () => {
   const plan = reapPlan([], LABEL);
   assert.deepEqual(plan.rmdirs, []);
   assert.deepEqual(plan.lazyUmounts, []);
+});
+
+// ===========================================================================
+// F1 regression (data safety): a MOUNTED dir is reapable ONLY when its source
+// device is ABSENT. A live source — foreign, ours, or ours under transient EIO —
+// is NEVER torn down. The OLD rule (reap when the target was merely unreadable)
+// would umount a live foreign/own mount on a passing EIO; these encode that dead.
+// ===========================================================================
+
+test('F1: a foreign identically-labeled LIVE mount (source present) is NEVER reaped', () => {
+  const plan = reapPlan(
+    [{ name: 'wdexternal', empty: false, mounted: true, source: '/dev/sdz1', sourcePresent: true }],
+    LABEL,
+  );
+  assert.deepEqual(plan.lazyUmounts, [], 'a live source must never be unmounted');
+  assert.deepEqual(plan.rmdirs, []);
+});
+
+test('F1: OUR live mount under a transient EIO (unreadable but source PRESENT) is NEVER reaped', () => {
+  // The proven exploit: an EIO made the target unlistable. The OLD deadness rule
+  // (mounted && contents===null) would tear this LIVE mount down. Source-present
+  // gating leaves it untouched.
+  const plan = reapPlan(
+    [{ name: 'wdexternal', empty: false, mounted: true, source: '/dev/sda1', sourcePresent: true }],
+    LABEL,
+  );
+  assert.deepEqual(plan.lazyUmounts, [], 'a transient EIO must not qualify as reapable');
+  assert.deepEqual(plan.rmdirs, []);
+});
+
+test('F1: a genuine ZOMBIE (source device ABSENT) is lazy-umounted THEN rmdir-ed', () => {
+  const plan = reapPlan(
+    [{ name: 'wdexternal (2)', empty: false, mounted: true, source: '/dev/sda1', sourcePresent: false }],
+    LABEL,
+  );
+  assert.deepEqual(plan.lazyUmounts, ['wdexternal (2)']);
+  assert.deepEqual(plan.rmdirs, ['wdexternal (2)']);
+});
+
+test('F1: an empty, unmounted, label-matched dir is rmdir-only (never umounted)', () => {
+  const plan = reapPlan(
+    [{ name: 'wdexternal', empty: true, mounted: false, source: null, sourcePresent: false }],
+    LABEL,
+  );
+  assert.deepEqual(plan.lazyUmounts, []);
+  assert.deepEqual(plan.rmdirs, ['wdexternal']);
 });

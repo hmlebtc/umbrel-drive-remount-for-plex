@@ -23,8 +23,15 @@ export interface ReapEntry {
   empty: boolean;
   /** Something is mounted on the directory. */
   mounted: boolean;
-  /** The mount on it is dead (source device gone / target unreadable / EIO). */
-  dead: boolean;
+  /** The mountinfo source device of the mount on this directory (null when unmounted). */
+  source: string | null;
+  /**
+   * Whether that source device STILL EXISTS on the system (F1). A LIVE source —
+   * foreign OR ours, INCLUDING a transient EIO where the device node is still
+   * present — is never reapable. Only an ABSENT source device makes a mount a
+   * genuine zombie of our drive that may be torn down.
+   */
+  sourcePresent: boolean;
 }
 
 export interface ReapPlan {
@@ -53,11 +60,18 @@ function escapeRegExp(s: string): string {
 /**
  * Plan the reap actions for a directory listing under externalBase.
  *
- *   live mount (mounted && !dead)  -> SKIP (untouchable — umbreld's own mount)
- *   dead mount  (mounted && dead)  -> `umount -l`, then rmdir if it became empty
- *   empty, unmounted               -> rmdir
- *   non-empty, unmounted           -> SKIP (never delete data)
- *   non-matching name              -> SKIP (foreign label)
+ *   live mount (mounted && sourcePresent)  -> SKIP (untouchable — a live device:
+ *                                             umbreld's own mount, a foreign
+ *                                             drive, or ours under transient EIO)
+ *   zombie      (mounted && !sourcePresent) -> `umount -l`, then rmdir if empty
+ *   empty, unmounted                        -> rmdir
+ *   non-empty, unmounted                    -> SKIP (never delete data)
+ *   non-matching name                       -> SKIP (foreign label)
+ *
+ * F1: reapability of a MOUNTED directory is gated on the SOURCE DEVICE being
+ * ABSENT — never on mere unreadability. A transient EIO on a live mount (our own
+ * or a foreign identically-labeled drive) leaves the source device present, so it
+ * is never torn down.
  */
 export function reapPlan(listing: ReapEntry[], label: string): ReapPlan {
   const rmdirs: string[] = [];
@@ -67,8 +81,8 @@ export function reapPlan(listing: ReapEntry[], label: string): ReapPlan {
     if (!matchesLabel(entry.name, label)) continue;
 
     if (entry.mounted) {
-      if (!entry.dead) continue; // live mount — never touch
-      // Dead mount: lazy-umount, then try to rmdir the now-idle directory.
+      if (entry.sourcePresent) continue; // live source — never touch
+      // Zombie mount (source device gone): lazy-umount, then rmdir if now empty.
       lazyUmounts.push(entry.name);
       rmdirs.push(entry.name);
       continue;

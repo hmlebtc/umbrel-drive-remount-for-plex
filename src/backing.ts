@@ -72,6 +72,7 @@ export function parseMountInfo(text: string): MountInfoEntry[] {
     out.push({
       mountId,
       parentId,
+      majorMinor: tokens[2]!,
       root: decodeOctal(tokens[3]!),
       mountpoint: decodeOctal(tokens[4]!),
       options: tokens[5]!.split(','),
@@ -96,6 +97,13 @@ export interface ClassifyOptions {
   externalBase: string;
   /** Our persisted bind record, or null before the first bind. */
   record: BackingRecord | null;
+  /**
+   * The by-uuid device's `major:minor` (spec section 2 "match source OR
+   * major:minor", F7). When set, a mountinfo entry whose SOURCE string is
+   * canonicalized differently but whose maj:min equals this still counts as our
+   * device — preventing a missed umbrelMount / a double-mount.
+   */
+  deviceMajMin?: string | null;
 }
 
 /**
@@ -110,14 +118,22 @@ export interface ClassifyOptions {
 export function classifyBacking(entries: MountInfoEntry[], opts: ClassifyOptions): BackingView {
   const { device, mountPoint, externalBase } = opts;
   const record = opts.record;
+  const deviceMajMin = opts.deviceMajMin ?? null;
   const basePrefix = externalBase.endsWith('/') ? externalBase : `${externalBase}/`;
+
+  // Spec section 2 / F7: an entry is "our device" when its source string equals
+  // the by-uuid device OR its maj:min matches (a differently-canonicalized source
+  // rendering must not hide our mount).
+  const isOurDevice = (e: MountInfoEntry): boolean =>
+    device !== null &&
+    (e.source === device || (deviceMajMin !== null && e.majorMinor === deviceMajMin));
 
   // --- umbrelMount ---------------------------------------------------------
   let umbrel: { path: string; mountId: number; source: string } | null = null;
   if (device !== null) {
     for (const e of entries) {
       if (e.root !== '/') continue;
-      if (e.source !== device) continue;
+      if (!isOurDevice(e)) continue;
       // A child directory under the external base (external/wdexternal), not the
       // base directory itself.
       if (e.mountpoint === externalBase) continue;
@@ -140,9 +156,10 @@ export function classifyBacking(entries: MountInfoEntry[], opts: ClassifyOptions
   const mounted = spEntry !== null;
   const source = spEntry?.source ?? '';
   const root = spEntry?.root ?? '';
+  const spIsOurDevice = spEntry !== null && isOurDevice(spEntry);
 
   const deviceGone = device === null;
-  const sourceMismatch = mounted && device !== null && source !== device;
+  const sourceMismatch = mounted && device !== null && !spIsOurDevice;
 
   let direct = false;
   let bindOfUmbrel = false;
@@ -163,7 +180,7 @@ export function classifyBacking(entries: MountInfoEntry[], opts: ClassifyOptions
     // No record (or "none"): infer. A fs-root mount of the live device at the
     // stable path is a classic direct mount; anything else is an unrecognised /
     // dead mount we should treat as stale.
-    if (!deviceGone && source === device && root === '/') {
+    if (!deviceGone && spIsOurDevice && root === '/') {
       direct = true;
     } else {
       stale = true;

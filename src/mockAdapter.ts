@@ -56,7 +56,9 @@ export type MockScenario =
   | 'ejectedInUmbrel'
   | 'bindStaleAfterReplug'
   | 'leftoverDirs'
-  | 'plexStartedBeforeBind';
+  | 'plexStartedBeforeBind'
+  // v0.2.0 fix-hardening hazards (adversarial review F1/F2).
+  | 'siblingPartitionMounted';
 
 /**
  * Test-facing controls to drive the umbreld simulation deterministically. These
@@ -80,6 +82,19 @@ export interface MockControl {
   setReplugAvailable(available: boolean): void;
   /** Disable umbreld's automounter entirely (models a stuck automount). */
   setUmbreldEnabled(enabled: boolean): void;
+  /**
+   * F1: mark a live mount's target as UNREADABLE (transient EIO) — listDir()
+   * returns null even though the mount is live and its source device is present.
+   * The proven exploit for the reap-tears-down-a-live-mount hazard.
+   */
+  setEio(hostPath: string, on: boolean): void;
+  /**
+   * F5: make `mount` report success (exit 0) WITHOUT actually adding a mount
+   * entry — a lying exit code the verify-the-mount-table check must catch.
+   */
+  setMountSilentlyFails(fails: boolean): void;
+  /** Add a directory under the external base (name + whether it holds non-mount files). */
+  addExternalDir(name: string, hasFiles?: boolean): void;
 }
 
 export interface MockHostAdapter extends HostAdapter, MockControl {
@@ -168,6 +183,8 @@ function normalizeScenario(raw: string): MockScenario | null {
     leftoverdirs: 'leftoverDirs',
     'plex-started-before-bind': 'plexStartedBeforeBind',
     plexstartedbeforebind: 'plexStartedBeforeBind',
+    'sibling-partition-mounted': 'siblingPartitionMounted',
+    siblingpartitionmounted: 'siblingPartitionMounted',
   };
   return map[key] ?? null;
 }
@@ -230,6 +247,16 @@ interface MockState {
   recreateFails: boolean;
   /** When true, the sysfs USB `authorized` dir exists (the replug can be synthesized). */
   replugAvailable: boolean;
+  /** F1: mount targets that error on listDir despite being LIVE (transient EIO). */
+  eioTargets: Set<string>;
+  /** F5: when true, `mount` returns exit 0 but does not add a mount entry. */
+  mountSilentlyFails: boolean;
+  /**
+   * Extra device nodes present on the system beyond the by-uuid device + root
+   * (e.g. a foreign drive or a mounted sibling partition). Drives exists() for
+   * /dev/* device presence — the F1 reap source-present check.
+   */
+  extraDevices: Set<string>;
   nextMountId: number;
 }
 
@@ -317,6 +344,9 @@ class MockHostAdapterImpl implements MockHostAdapter {
       umbreldEnabled: true,
       recreateFails: false,
       replugAvailable: true,
+      eioTargets: new Set<string>(),
+      mountSilentlyFails: false,
+      extraDevices: new Set<string>(),
       nextMountId: 30,
     };
   }
@@ -354,7 +384,8 @@ class MockHostAdapterImpl implements MockHostAdapter {
       scenario === 'ejectedInUmbrel' ||
       scenario === 'bindStaleAfterReplug' ||
       scenario === 'leftoverDirs' ||
-      scenario === 'plexStartedBeforeBind'
+      scenario === 'plexStartedBeforeBind' ||
+      scenario === 'siblingPartitionMounted'
     );
   }
 
@@ -515,6 +546,25 @@ class MockHostAdapterImpl implements MockHostAdapter {
         state.container.view = Object.keys(state.deviceFolders);
         break;
       }
+      case 'siblingPartitionMounted': {
+        // F2 (physical safety): the external drive is a WHOLE USB disk (sdc) with
+        // our partition sdc1 currently UNmounted, but a sibling partition sdc2 is
+        // mounted elsewhere. A partition-scoped guard sees zero mounts of sdc1 and
+        // would de-authorize the whole disk — yanking power from live sdc2. The
+        // whole-disk guard must veto. Root stays on a DIFFERENT disk (sda) so it
+        // is not a false positive.
+        state.uuidDevice = '/dev/sdc1';
+        state.disk = 'sdc';
+        state.extraDevices.add('/dev/sdc2');
+        state.mounts = [
+          this.mkMount(
+            { source: '/dev/sdc2', target: '/mnt/other', fsType: 'ext4', options: ['rw', 'relatime'], owner: 'system', root: '/' },
+            state,
+          ),
+        ];
+        state.container.view = null;
+        break;
+      }
       case 'plexStartedBeforeBind': {
         // Backing looks correct (umbrel mount + our bind, host media visible) but
         // Plex started BEFORE the bind, so its in-container view is empty/dead.
@@ -596,6 +646,32 @@ class MockHostAdapterImpl implements MockHostAdapter {
 
   setUmbreldEnabled(enabled: boolean): void {
     this.state.umbreldEnabled = enabled;
+  }
+
+  setEio(hostPath: string, on: boolean): void {
+    if (on) this.state.eioTargets.add(hostPath);
+    else this.state.eioTargets.delete(hostPath);
+  }
+
+  setMountSilentlyFails(fails: boolean): void {
+    this.state.mountSilentlyFails = fails;
+  }
+
+  addExternalDir(name: string, hasFiles = false): void {
+    this.state.externalDirs.set(`${this.externalBase()}/${name}`, hasFiles);
+  }
+
+  /**
+   * Is a /dev/* device node present on the system? True for the by-uuid device
+   * (when attached), the root device, and any explicitly-added extra device
+   * (foreign drive / mounted sibling partition). Drives the F1 reap source-present
+   * check (a zombie's source is ABSENT; a live mount's source — foreign, ours, or
+   * ours-under-EIO — is PRESENT).
+   */
+  private deviceIsPresent(dev: string): boolean {
+    if (dev === ROOT_DEVICE) return true;
+    if (this.state.uuidPresent && dev === this.state.uuidDevice) return true;
+    return this.state.extraDevices.has(dev);
   }
 
   umbrelMountPath(): string | null {
@@ -682,6 +758,8 @@ class MockHostAdapterImpl implements MockHostAdapter {
 
   async exists(hostPath: string): Promise<boolean> {
     if (hostPath === byUuidPath(this.s)) return this.state.uuidPresent;
+    // /dev/* device-node presence (F1 reap source-present check).
+    if (/^\/dev\//.test(hostPath)) return this.deviceIsPresent(hostPath);
     if (this.state.externalDirs.has(hostPath)) return true;
     // sysfs USB device dir attributes the replug walk (sysfsReplug) looks for.
     if (hostPath === `${USB_DEVICE_DIR}/authorized` || hostPath === `${USB_DEVICE_DIR}/idVendor`) {
@@ -695,6 +773,11 @@ class MockHostAdapterImpl implements MockHostAdapter {
 
   async listDir(hostPath: string): Promise<string[] | null> {
     const base = this.externalBase();
+
+    // F1: a transient EIO makes a LIVE mount's target unreadable (null) even
+    // though the mount is up and its source device is present. (The external
+    // base itself is never EIO-marked, so its listing is unaffected.)
+    if (hostPath !== base && this.state.eioTargets.has(hostPath)) return null;
 
     // The external base itself lists its child directory names.
     if (hostPath === base) {
@@ -866,6 +949,9 @@ class MockHostAdapterImpl implements MockHostAdapter {
     const resolved =
       src === byUuidPath(this.s) ? (this.state.uuidPresent ? this.state.uuidDevice : null) : src;
     if (resolved === null || resolved === '') return false;
+    // F5: a lying exit code — report success but do NOT register the mount, so the
+    // caller's mount-table verification is what must catch it.
+    if (this.state.mountSilentlyFails) return true;
     this.state.mounts = this.state.mounts.filter((m) => m.target !== target);
     this.state.mounts.push(this.appDirectAt(this.state, resolved));
     return true;

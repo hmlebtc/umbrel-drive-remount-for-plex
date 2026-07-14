@@ -27,8 +27,12 @@ ARG GIT_SHA=dev
 # App semver version threaded in the same way. .dockerignore also
 # excludes hmlebtc-drive-remount-for-plex/ (the Umbrel app dir where the
 # canonical umbrel-app.yml lives), so version.ts cannot read the manifest
-# off disk during a Docker build - without this arg it falls back to the
-# version baked into package.json instead (which is also kept at 0.1.0).
+# off disk during a Docker build. package.json is now at 0.2.0, but there
+# is no fallback to it: without this arg, the image simply reports
+# "unknown". CI always passes APP_VERSION from umbrel-app.yml (see
+# .github/workflows/docker-publish.yml), so released images correctly
+# report 0.2.0 - "unknown" only shows up in a manual/local build that
+# omits --build-arg APP_VERSION.
 ARG APP_VERSION=unknown
 
 # ---------------------------------------------------------------------------

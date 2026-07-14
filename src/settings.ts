@@ -42,6 +42,7 @@ export function defaultSettings(): Settings {
     umbrelRoot: '/home/umbrel/umbrel',
     containerMediaPath: '/media/wdexternal',
     mountMode: 'classic',
+    driveLabel: 'wdexternal',
     graceSec: 180,
     autoHeal: {
       enabled: true,
@@ -91,6 +92,10 @@ const FSTYPE_RE = /^[a-z0-9]+$/;
 const ABS_PATH_RE = /^\/[A-Za-z0-9._/-]*$/;
 const REL_PATH_RE = /^[A-Za-z0-9._/-]*$/;
 const APP_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+// umbreld's sanitized-label charset (spec section 0): the only characters a
+// /External directory name (which reaping matches) can contain.
+const DRIVE_LABEL_RE = /^[a-zA-Z0-9 '_-]*$/;
+const MAX_DRIVE_LABEL = 255;
 
 const MAX_FOLDERS = 64;
 const MAX_FOLDER_NAME = 255;
@@ -175,6 +180,13 @@ export function validateSettings(input: Settings): ValidationResult {
   c.mountMode = String(c.mountMode ?? '').trim() as MountMode;
   if (c.mountMode !== 'classic' && c.mountMode !== 'cooperative') {
     reset('mountMode', 'mountMode must be "classic" or "cooperative"');
+  }
+
+  // driveLabel is the sanitized FS label (reaping match key). An empty value is
+  // allowed to persist (reap then falls back to basename(mountPoint)).
+  c.driveLabel = String(c.driveLabel ?? '').trim();
+  if (c.driveLabel.length > MAX_DRIVE_LABEL || !DRIVE_LABEL_RE.test(c.driveLabel)) {
+    reset('driveLabel', 'driveLabel must only use umbrelOS label characters [a-zA-Z0-9 \'_-]');
   }
 
   // graceSec is clamped (never a hard error), mirroring the auto-heal numerics.
@@ -267,6 +279,7 @@ export function seedSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): Setti
   if (env.DRP_UMBREL_ROOT) c.umbrelRoot = env.DRP_UMBREL_ROOT;
   if (env.DRP_CONTAINER_MEDIA_PATH) c.containerMediaPath = env.DRP_CONTAINER_MEDIA_PATH;
   if (env.DRP_MOUNT_MODE) c.mountMode = env.DRP_MOUNT_MODE.trim() as MountMode;
+  if (env.DRP_DRIVE_LABEL !== undefined) c.driveLabel = env.DRP_DRIVE_LABEL;
   if (env.DRP_GRACE_SECONDS) c.graceSec = Number(env.DRP_GRACE_SECONDS);
 
   const enabled = envBool(env.DRP_AUTOHEAL_ENABLED);

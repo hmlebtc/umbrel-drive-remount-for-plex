@@ -222,6 +222,44 @@ test('classifyBacking: nothing mounted — clean empty view, record echoed', () 
 });
 
 // ===========================================================================
+// F7: match a device by SOURCE string OR major:minor (spec §2). A mountinfo
+// whose source is canonicalized differently but shares the by-uuid device's
+// maj:min must still be detected — otherwise the umbrelMount is missed and a
+// second (double) mount is made.
+// ===========================================================================
+
+test('classifyBacking [F7]: umbrelMount whose source differs but maj:min matches is detected', () => {
+  // The /External mount renders its source as the by-uuid symlink, not /dev/sda1,
+  // but carries the same major:minor (8:1).
+  const mi =
+    '101 24 8:1 / /home/umbrel/umbrel/external/wdexternal rw,relatime - ext4 /dev/disk/by-uuid/xxx rw\n';
+  const v = classifyBacking(parseMountInfo(mi), {
+    device: '/dev/sda1',
+    mountPoint: MOUNT_POINT,
+    externalBase: EXTERNAL_BASE,
+    record: record(),
+    deviceMajMin: '8:1',
+  });
+  assert.equal(v.umbrelMount.found, true, 'matched by maj:min despite a different source string');
+  assert.equal(v.umbrelMount.path, `${EXTERNAL_BASE}/wdexternal`);
+});
+
+test('classifyBacking [F7]: a direct stable-path mount matched by maj:min is NOT flagged stale', () => {
+  const mi =
+    '140 24 8:1 / /mnt/wdexternal rw,relatime - ext4 /dev/disk/by-uuid/xxx rw\n';
+  const v = classifyBacking(parseMountInfo(mi), {
+    device: '/dev/sda1',
+    mountPoint: MOUNT_POINT,
+    externalBase: EXTERNAL_BASE,
+    record: record({ active: 'direct' }),
+    deviceMajMin: '8:1',
+  });
+  assert.equal(v.stablePath.mounted, true);
+  assert.equal(v.stablePath.direct, true);
+  assert.equal(v.stablePath.stale, false, 'maj:min match means the source is our device, not a mismatch');
+});
+
+// ===========================================================================
 // classifyBacking driven off the MOCK's synthesized mountinfo (proves the
 // coexistence simulation feeds the classifier the states the ladder expects).
 // ===========================================================================

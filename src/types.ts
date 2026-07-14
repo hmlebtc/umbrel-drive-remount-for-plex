@@ -52,6 +52,12 @@ export interface Settings {
   containerMediaPath: string;
   /** Backing mode for the stable path (default "classic"; upgrade-safe). */
   mountMode: MountMode;
+  /**
+   * The drive's real (sanitized) filesystem LABEL — the umbrelOS /External
+   * directory name reaping matches against (spec section 4, F8). Seeded
+   * "wdexternal"; falls back to basename(mountPoint) when empty.
+   */
+  driveLabel: string;
   /** Seconds to wait for umbreld to mount the drive before classic fallback (60–900, default 180). */
   graceSec: number;
   autoHeal: AutoHealSettings;
@@ -157,6 +163,8 @@ export type BackingActive = 'umbrel-bind' | 'direct' | 'none';
 export interface MountInfoEntry {
   mountId: number;
   parentId: number;
+  /** The `major:minor` device number (mountinfo token[2]); F7 device-match fallback. */
+  majorMinor: string;
   root: string;
   mountpoint: string;
   options: string[];

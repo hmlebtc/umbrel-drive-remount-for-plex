@@ -37,7 +37,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { bookRestoreOutcome, decide, type RestoreBookkeeping } from "./monitor.js";
+import {
+  bookRestoreOutcome,
+  coopRecreateAllowed,
+  decide,
+  recordCoopRecreate,
+  type CoopRecreateGate,
+  type RestoreBookkeeping,
+} from "./monitor.js";
 import { plexNeedsRecreate } from "./backingEngine.js";
 import { probeStatus } from "./status.js";
 import { createMockAdapter } from "./mockAdapter.js";
@@ -437,6 +444,43 @@ test("plexNeedsRecreate: started AFTER the bind and liveOk true -> no recreate",
     plex: { found: true, containerName: "plex_server_1", state: "running", bindOk: true, binds: [], liveOk: true, startedAt: "2026-07-08T13:00:00.000Z" },
   });
   assert.equal(plexNeedsRecreate(status, rec({ lastBindChangeAt: "2026-07-08T12:00:00.000Z" })).recreate, false);
+});
+
+// ===========================================================================
+// F6: the cooperative Plex-recreate gate — cooldown + consecutive-failure
+// suspension so a persistently liveOk-false backing cannot spin a recreate loop.
+// ===========================================================================
+
+function gate(overrides: Partial<CoopRecreateGate> = {}): CoopRecreateGate {
+  return { lastAtMs: null, consecutiveFailures: 0, suspended: false, ...overrides };
+}
+
+test("F6: first recreate is allowed; a second within the cooldown is blocked", () => {
+  const t0 = 1_000_000;
+  assert.equal(coopRecreateAllowed(gate(), t0, 300), true, "first recreate allowed");
+  const after = recordCoopRecreate(gate(), t0, true, 3);
+  // 100s later, still inside a 300s cooldown -> blocked (at most one per cooldown).
+  assert.equal(coopRecreateAllowed(after, t0 + 100_000, 300), false, "blocked within cooldown");
+  // 301s later -> allowed again.
+  assert.equal(coopRecreateAllowed(after, t0 + 301_000, 300), true, "allowed after cooldown");
+});
+
+test("F6: N consecutive recreate FAILURES suspend the gate", () => {
+  let g = gate();
+  let t = 0;
+  for (let i = 0; i < 3; i++) {
+    g = recordCoopRecreate(g, t, false, 3);
+    t += 400_000; // step past cooldown each time
+  }
+  assert.equal(g.consecutiveFailures, 3);
+  assert.equal(g.suspended, true, "suspended after 3 failures");
+  assert.equal(coopRecreateAllowed(g, t + 1_000_000, 300), false, "suspended blocks even past cooldown");
+});
+
+test("F6: a successful recreate resets the failure count and lifts suspension", () => {
+  const g = recordCoopRecreate(gate({ consecutiveFailures: 2, suspended: true }), 5_000, true, 3);
+  assert.equal(g.consecutiveFailures, 0);
+  assert.equal(g.suspended, false);
 });
 
 test("plexNeedsRecreate: integration — mock 'plexStartedBeforeBind' reports an early StartedAt that trips the rule", async () => {

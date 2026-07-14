@@ -140,6 +140,39 @@ export function bookRestoreOutcome(
   return { consecutiveFailures, consecutiveBroken: prev.consecutiveBroken, suspended, jobRunning: false };
 }
 
+/**
+ * F6: cooperative Plex-recreate gate — mirrors the classic auto-heal cooldown +
+ * consecutive-failure suspension so a persistently liveOk-false backing can never
+ * spin a recreate loop. Purely functional so the gate is unit-testable.
+ */
+export interface CoopRecreateGate {
+  /** Monotonic-ish ms of the last recreate ATTEMPT, or null. */
+  lastAtMs: number | null;
+  consecutiveFailures: number;
+  suspended: boolean;
+}
+
+export function coopRecreateAllowed(gate: CoopRecreateGate, nowMs: number, cooldownSec: number): boolean {
+  if (gate.suspended) return false;
+  if (gate.lastAtMs !== null && nowMs - gate.lastAtMs < cooldownSec * 1000) return false;
+  return true;
+}
+
+export function recordCoopRecreate(
+  gate: CoopRecreateGate,
+  nowMs: number,
+  ok: boolean,
+  maxConsecutiveFailures: number,
+): CoopRecreateGate {
+  if (ok) return { lastAtMs: nowMs, consecutiveFailures: 0, suspended: false };
+  const consecutiveFailures = gate.consecutiveFailures + 1;
+  return {
+    lastAtMs: nowMs,
+    consecutiveFailures,
+    suspended: consecutiveFailures >= maxConsecutiveFailures,
+  };
+}
+
 export interface MonitorDeps {
   adapter: HostAdapter;
   getSettings: () => Settings;
@@ -164,6 +197,8 @@ export class Monitor {
   private ticking = false;
   private lastCheckAt: string | null = null;
   private lastActionAt: string | null = null;
+  /** F6: cooldown + suspension gate for cooperative liveness-driven recreates. */
+  private coopRecreateGate: CoopRecreateGate = { lastAtMs: null, consecutiveFailures: 0, suspended: false };
 
   constructor(private readonly deps: MonitorDeps) {}
 
@@ -322,68 +357,105 @@ export class Monitor {
    * single-flight restore lock so it never races a switch/restore job.
    */
   private async tickCooperative(settings: Settings): Promise<void> {
-    if (this.deps.restore.isRunning()) return;
     const backing = this.deps.backing!;
     const log = (line: string): void => this.deps.events?.info('backing', line);
 
-    let evalRes;
-    try {
-      evalRes = await backing.evaluate(settings);
-    } catch (e) {
-      this.deps.events?.error('monitor', `backing evaluate failed: ${errMsg(e)}`);
-      return;
-    }
-    this.lastCheckAt = new Date().toISOString();
-    const { view, decision } = evalRes;
-
-    let changed = false;
-    try {
-      switch (decision.action) {
-        case 'wait':
-          this.deps.events?.info('monitor', `backing: ${decision.reason}`);
-          // Reap leftover/dead dirs so umbreld can reuse the clean name.
-          await backing.reap(settings, log);
-          break;
-        case 'bind':
-        case 'handover':
-          this.deps.events?.info('monitor', `backing: ${decision.reason}`);
-          if (view.umbrelMount.path !== null) {
-            changed = await backing.doBind(view.umbrelMount.path, view, settings, log);
-          }
-          break;
-        case 'direct-mount':
-          this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
-          changed = await backing.doDirectMount(view, settings, log);
-          break;
-        case 'release':
-          this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
-          await backing.doRelease(view, settings, log);
-          break;
-        case 'none':
-          break;
-      }
-
-      if (changed) {
-        this.lastActionAt = new Date().toISOString();
-        await backing.recreate(settings, log);
+    // F4: the ENTIRE cooperative mutating tick runs under the SAME single-flight
+    // lock as restore/switch jobs. If a job (or a concurrent tick) holds it, this
+    // tick is skipped — it never interleaves mount/backing.json mutations with a
+    // switch. evaluate()/reap()/doBind()/… run only inside the lock, so the state
+    // they read and mutate cannot be raced by a job landing mid-tick.
+    const result = await this.deps.restore.withCoopLock(async () => {
+      let evalRes;
+      try {
+        evalRes = await backing.evaluate(settings);
+      } catch (e) {
+        this.deps.events?.error('monitor', `backing evaluate failed: ${errMsg(e)}`);
         return;
       }
+      this.lastCheckAt = new Date().toISOString();
+      const { view, decision } = evalRes;
 
-      // No bind change this tick: apply the Plex-liveness / bind-generation
-      // recreate rule (never after a release — there is nothing to point at).
-      if (decision.action !== 'release') {
-        const status = await probeStatus(this.deps.adapter, settings, {
-          backing: await backing.backingStatus(settings),
-        });
-        const need = plexNeedsRecreate(status, backing.getRecord());
-        if (need.recreate) {
-          this.deps.events?.info('monitor', `recreating Plex: ${need.reason}`);
+      let changed = false;
+      try {
+        switch (decision.action) {
+          case 'wait':
+            this.deps.events?.info('monitor', `backing: ${decision.reason}`);
+            // Reap leftover/dead dirs so umbreld can reuse the clean name.
+            await backing.reap(settings, log);
+            break;
+          case 'bind':
+          case 'handover':
+            this.deps.events?.info('monitor', `backing: ${decision.reason}`);
+            if (view.umbrelMount.path !== null) {
+              changed = await backing.doBind(view.umbrelMount.path, view, settings, log);
+            }
+            break;
+          case 'direct-mount':
+            this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
+            changed = await backing.doDirectMount(view, settings, log);
+            break;
+          case 'release':
+            this.deps.events?.warn('monitor', `backing: ${decision.reason}`);
+            await backing.doRelease(view, settings, log);
+            break;
+          case 'none':
+            break;
+        }
+
+        if (changed) {
           this.lastActionAt = new Date().toISOString();
           await backing.recreate(settings, log);
+          return;
         }
+
+        // No bind change this tick: apply the Plex-liveness / bind-generation
+        // recreate rule (never after a release — there is nothing to point at).
+        if (decision.action !== 'release') {
+          const status = await probeStatus(this.deps.adapter, settings, {
+            backing: await backing.backingStatus(settings),
+          });
+          const need = plexNeedsRecreate(status, backing.getRecord());
+          if (need.recreate) {
+            // F6: gate the liveness-driven recreate with a cooldown + consecutive
+            // -failure suspension (like the classic auto-heal path) so a stuck
+            // liveOk-false backing cannot spin a recreate loop.
+            const ah = settings.autoHeal;
+            const nowMs = Date.now();
+            if (!coopRecreateAllowed(this.coopRecreateGate, nowMs, ah.cooldownSec)) {
+              this.deps.events?.info(
+                'monitor',
+                this.coopRecreateGate.suspended
+                  ? 'skipping Plex recreate: cooperative recreate is suspended after repeated failures'
+                  : 'skipping Plex recreate: within the cooperative recreate cooldown',
+              );
+            } else {
+              this.deps.events?.info('monitor', `recreating Plex: ${need.reason}`);
+              this.lastActionAt = new Date().toISOString();
+              const ok = await backing.recreate(settings, log);
+              const wasSuspended = this.coopRecreateGate.suspended;
+              this.coopRecreateGate = recordCoopRecreate(
+                this.coopRecreateGate,
+                nowMs,
+                ok,
+                ah.maxConsecutiveFailures,
+              );
+              if (this.coopRecreateGate.suspended && !wasSuspended) {
+                this.deps.events?.warn(
+                  'monitor',
+                  `cooperative Plex recreate suspended after ${this.coopRecreateGate.consecutiveFailures} consecutive failures`,
+                );
+              }
+            }
+          }
+        }
+      } catch (e) {
+        this.deps.events?.error('monitor', `backing tick failed: ${errMsg(e)}`);
       }
-    } catch (e) {
-      this.deps.events?.error('monitor', `backing tick failed: ${errMsg(e)}`);
+    });
+    if (!result.ran) {
+      // A restore/switch job (or a concurrent tick) holds the shared lock.
+      return;
     }
   }
 

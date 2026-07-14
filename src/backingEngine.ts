@@ -14,10 +14,12 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, posix } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { backingDecide, classifyBacking, parseMountInfo } from './backing.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
+import { findMount, parseProcMounts } from './mounts.js';
 import { byUuidPath, externalBase } from './paths.js';
 import { probeLiveOk, recreatePlex } from './plex.js';
 import { reapPlan, type ReapEntry } from './reap.js';
@@ -46,6 +48,20 @@ function nowIso(): string {
 }
 
 /**
+ * The `major:minor` of our by-uuid device as it appears in the live mount table
+ * (F7). Derived from any mountinfo entry whose SOURCE already equals the device,
+ * so a second entry with a differently-canonicalized source but the same maj:min
+ * still resolves to our device. Null when the drive is absent or unseen.
+ */
+function deviceMajMinOf(entries: MountInfoEntry[], device: string | null): string | null {
+  if (device === null) return null;
+  for (const e of entries) {
+    if (e.source === device) return e.majorMinor;
+  }
+  return null;
+}
+
+/**
  * Single-quote a sysfs path for a `sh -c` redirect. Paths come only from the
  * /sys tree walk (never user input); we still quote as defense in depth and a
  * literal `'` — impossible in a sysfs path — would be neutralised by the
@@ -53,6 +69,10 @@ function nowIso(): string {
  */
 function shquote(p: string): string {
   return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function defaultRecord(mode: Settings['mountMode']): BackingRecord {
@@ -159,6 +179,16 @@ export class BackingEngine {
   private reaped: ReapCounts = { dirs: 0, mounts: 0 };
   private drivePresentPrev: boolean | null = null;
   private bootChecked = false;
+  /**
+   * F3: the grace window is anchored to an in-memory MONOTONIC clock set at this
+   * boot (engine construction / drive-arrival / handover), NEVER to a persisted
+   * wall-clock. A power loss during grace → fresh process → anchor null → the
+   * first tick starts a full fresh window; an RTC skew can never make grace fire
+   * early or never (the value is clamped to [0, graceSec]). graceStartedAt stays
+   * in the record purely as the "an arrival-flow grace was started" marker the
+   * ladder reads (never as the timer source).
+   */
+  private graceAnchorMono: number | null = null;
 
   constructor(
     private readonly adapter: HostAdapter,
@@ -185,20 +215,21 @@ export class BackingEngine {
   // --- grace ---------------------------------------------------------------
 
   private startGrace(force: boolean): void {
-    const rec = this.store.get();
-    if (force || rec.graceStartedAt === null) {
+    if (force || this.graceAnchorMono === null) {
+      // Anchor the timer to the monotonic clock (F3); persist graceStartedAt only
+      // as the arrival-flow marker the ladder reads.
+      this.graceAnchorMono = performance.now();
       this.persist({ graceStartedAt: nowIso() });
     }
   }
 
   private graceRemainingSec(settings: Settings): number {
-    const rec = this.store.get();
-    if (rec.graceStartedAt === null) return 0;
-    const started = Date.parse(rec.graceStartedAt);
-    if (!Number.isFinite(started)) return 0;
     const graceSec = settings.graceSec ?? 180;
-    const elapsed = Math.floor((Date.now() - started) / 1000);
-    return Math.max(0, graceSec - elapsed);
+    if (this.graceAnchorMono === null) return 0;
+    const elapsed = Math.floor((performance.now() - this.graceAnchorMono) / 1000);
+    // Clamp to [0, graceSec]: never negative (stale anchor), never > graceSec
+    // (a future-dated / RTC-skewed anchor can't produce a multi-day wait).
+    return Math.min(graceSec, Math.max(0, graceSec - elapsed));
   }
 
   // --- discovery -----------------------------------------------------------
@@ -231,6 +262,7 @@ export class BackingEngine {
       mountPoint: settings.mountPoint,
       externalBase: externalBase(settings),
       record: this.store.get(),
+      deviceMajMin: deviceMajMinOf(entries, device),
     });
 
     let umbrelReadable = false;
@@ -295,6 +327,23 @@ export class BackingEngine {
     if (device === null) return [];
     const entries = await this.mountInfo();
     return entries.filter((e) => e.source === device).map((e) => e.mountpoint);
+  }
+
+  /**
+   * F2: mountpoints of EVERY live mount whose source is under our physical DISK
+   * — the whole-disk partition set (/dev/<disk>, /dev/<disk><N>, /dev/<disk>p<N>).
+   * The sysfs replug de-authorizes the WHOLE USB disk, so ANY mounted sibling
+   * partition (swap, a second Files mount, another fs) MUST veto it — the
+   * partition-scoped {@link deviceLiveMounts} guard is not sufficient.
+   */
+  async diskLiveMounts(settings: Settings): Promise<string[]> {
+    const device = await this.device(settings);
+    if (device === null) return [];
+    const disk = this.diskOf(device);
+    if (disk === null) return [];
+    const re = new RegExp(`^/dev/${escapeRegExp(disk)}(p?\\d+)?$`);
+    const entries = await this.mountInfo();
+    return entries.filter((e) => re.test(e.source)).map((e) => e.mountpoint);
   }
 
   /** `umount -l <target>`; returns whether it succeeded. Used by the migration job. */
@@ -364,6 +413,16 @@ export class BackingEngine {
       log(`direct mount failed (code ${m.code}): ${m.stderr.trim()}`);
       return false;
     }
+    // F5: never trust the exit code — re-parse /proc/1/mounts and confirm the
+    // mount actually materialized before persisting active='direct'. A backing
+    // state the mount table doesn't corroborate is worse than a reported failure
+    // (Plex would be dark while status claims 'direct').
+    const after = findMount(parseProcMounts(await this.adapter.readProcMounts()), settings.mountPoint);
+    if (after === null) {
+      log(`direct mount reported success (code 0) but ${settings.mountPoint} is absent from the mount table — not persisting 'direct'`);
+      this.activity('error', `direct mount of ${settings.mountPoint} could not be verified — Plex has no backing; reconnect the drive`);
+      return false;
+    }
     const rec = this.store.get();
     this.persist({
       active: 'direct',
@@ -402,6 +461,17 @@ export class BackingEngine {
 
   // --- reaping (spec section 4) --------------------------------------------
 
+  /**
+   * The label reaping matches names against (F8): the drive's real sanitized FS
+   * label (settings.driveLabel, seeded "wdexternal"), falling back to
+   * basename(mountPoint) only when it is empty — so a drive whose label differs
+   * from the mount-point basename still has its drift dirs reaped.
+   */
+  private reapLabel(settings: Settings): string {
+    const explicit = (settings.driveLabel ?? '').trim();
+    return explicit !== '' ? explicit : posix.basename(settings.mountPoint);
+  }
+
   async reap(settings: Settings, log: LogSink = NOOP_LOG): Promise<ReapCounts> {
     const base = externalBase(settings);
     const names = await this.adapter.listDir(base);
@@ -409,18 +479,28 @@ export class BackingEngine {
 
     const entries = await this.mountInfo();
     const mountedAt = new Map<string, MountInfoEntry>();
-    for (const e of entries) mountedAt.set(e.mountpoint, e);
+    // Newest mountId wins (the top-of-stack mount owns the mountpoint).
+    for (const e of entries) {
+      const prev = mountedAt.get(e.mountpoint);
+      if (prev === undefined || e.mountId > prev.mountId) mountedAt.set(e.mountpoint, e);
+    }
 
-    const label = posix.basename(settings.mountPoint);
+    const label = this.reapLabel(settings);
     const listing: ReapEntry[] = [];
     for (const name of names.slice(0, REAP_SCAN_LIMIT)) {
       const dirPath = posix.join(base, name);
+      const mountEntry = mountedAt.get(dirPath) ?? null;
+      const mounted = mountEntry !== null;
       const contents = await this.adapter.listDir(dirPath);
-      const mounted = mountedAt.has(dirPath);
-      // Dead = mounted but the target cannot be listed (source device gone / EIO).
-      const dead = mounted && contents === null;
       const empty = contents !== null && contents.length === 0;
-      listing.push({ name, empty, mounted, dead });
+      const source = mountEntry?.source ?? null;
+      // F1: a mounted dir is reapable ONLY when its SOURCE DEVICE is ABSENT (a
+      // genuine zombie of our drive). Presence is a real device-node check
+      // (adapter.exists / lstat), NOT the target's listability — a transient EIO
+      // on a LIVE mount (ours or a foreign identically-labeled drive) leaves the
+      // source present and must never be torn down.
+      const sourcePresent = source !== null ? await this.adapter.exists(source) : false;
+      listing.push({ name, empty, mounted, source, sourcePresent });
     }
 
     const plan = reapPlan(listing, label);
@@ -470,6 +550,19 @@ export class BackingEngine {
     const disk = this.diskOf(device);
     if (disk === null) {
       log(`sysfs replug: could not derive a whole-disk name from ${device}`);
+      return { ok: false, manual: true };
+    }
+    // F2 (physical safety): the toggle de-authorizes the ENTIRE disk. Before
+    // touching `authorized`, veto if ANY partition of the disk still holds a live
+    // mount — yanking power from a live sibling fs corrupts it. Fall back to a
+    // manual unplug/replug (the user pulls the cable only when they choose to).
+    const diskMounts = await this.diskLiveMounts(settings);
+    if (diskMounts.length > 0) {
+      log(
+        `sysfs replug: disk ${disk} still holds ${diskMounts.length} live mount(s) ` +
+          `(${diskMounts.join(', ')}); refusing to de-authorize the whole disk — a manual USB replug is required`,
+      );
+      this.activity('warn', `refused sysfs replug: disk ${disk} has live mount(s) (${diskMounts.join(', ')})`);
       return { ok: false, manual: true };
     }
     const blockLink = `/sys/block/${disk}`;
@@ -585,6 +678,7 @@ export class BackingEngine {
       mountPoint: settings.mountPoint,
       externalBase: externalBase(settings),
       record: rec,
+      deviceMajMin: deviceMajMinOf(entries, device),
     });
     let readable = false;
     if (view.umbrelMount.found && view.umbrelMount.path !== null) {

@@ -69,6 +69,14 @@ export interface RestoreRunner {
   startSwitch(mode: MountMode): { ok: true; jobId: string } | { ok: false; error: string };
   getJob(): RestoreJob | null;
   isRunning(): boolean;
+  /**
+   * F4: run a cooperative-monitor MUTATION under the SAME single-flight lock as
+   * restore/switch jobs. Acquires synchronously (no interleaving with a job that
+   * is starting) and returns {ran:false} without invoking `fn` when a job or
+   * another cooperative mutation already holds the lock. Read-only probes must
+   * NOT use this — they stay lock-free.
+   */
+  withCoopLock<T>(fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }>;
 }
 
 function errMsg(e: unknown): string {
@@ -114,6 +122,8 @@ function restoreHealthy(s: AppStatus, settings: Settings): boolean {
 
 class RestoreRunnerImpl implements RestoreRunner {
   private job: RestoreJob | null = null;
+  /** F4: held while a cooperative-monitor mutation runs; part of the shared lock. */
+  private coopLocked = false;
   private readonly backing?: BackingEngine;
   private readonly settingsStore?: SettingsStore;
   private readonly onModeChange?: () => void;
@@ -150,15 +160,30 @@ class RestoreRunnerImpl implements RestoreRunner {
   }
 
   isRunning(): boolean {
-    return this.job?.running === true;
+    // The shared single-flight lock is held by EITHER a job OR an in-flight
+    // cooperative mutation (F4).
+    return this.job?.running === true || this.coopLocked;
   }
 
   getJob(): RestoreJob | null {
     return this.job;
   }
 
+  async withCoopLock<T>(fn: () => Promise<T>): Promise<{ ran: true; value: T } | { ran: false }> {
+    // Synchronous check-and-set before the first await: no two acquirers, and no
+    // job that is mid-start (job.running is set synchronously in start/startSwitch).
+    if (this.job?.running || this.coopLocked) return { ran: false };
+    this.coopLocked = true;
+    try {
+      const value = await fn();
+      return { ran: true, value };
+    } finally {
+      this.coopLocked = false;
+    }
+  }
+
   start(trigger: RestoreTrigger): { ok: true; jobId: string } | { ok: false; error: string } {
-    if (this.job?.running) {
+    if (this.job?.running || this.coopLocked) {
       return { ok: false, error: 'a restore job is already running' };
     }
     const jobId = randomUUID();
@@ -182,7 +207,7 @@ class RestoreRunnerImpl implements RestoreRunner {
   }
 
   startSwitch(mode: MountMode): { ok: true; jobId: string } | { ok: false; error: string } {
-    if (this.job?.running) {
+    if (this.job?.running || this.coopLocked) {
       return { ok: false, error: 'a job is already running' };
     }
     if (!this.backing) {
@@ -639,10 +664,13 @@ class RestoreRunnerImpl implements RestoreRunner {
       // device lingers, we do NOT force-umount it; we fall back to a manual replug.
       const rescan = this.beginStep(job, 'rescan');
       let replugManual = false;
-      if (live.length > 0) {
+      // F2: the sysfs replug de-authorizes the WHOLE disk, so gate on ANY live
+      // mount across ALL partitions of the physical disk, not just our partition.
+      const diskLive = await backing.diskLiveMounts(settings);
+      if (diskLive.length > 0) {
         this.logLine(
           rescan,
-          `device still holds ${live.length} live mount(s) (${live.join(', ')}) — skipping the sysfs replug (unsafe); a manual USB replug is required`,
+          `disk still holds ${diskLive.length} live mount(s) (${diskLive.join(', ')}) — skipping the sysfs replug (would yank a live sibling partition); a manual USB replug is required`,
         );
         replugManual = true;
       } else {
@@ -660,23 +688,51 @@ class RestoreRunnerImpl implements RestoreRunner {
       const umbrelPath = await this.waitForUmbrelMount(settings, graceMs);
       if (umbrelPath === null) {
         if (replugManual) {
-          // Documented fallback: leave cooperative + backing none, instruct a
-          // manual replug; the monitor finishes via ladder A when it appears.
-          this.logLine(wait, 'umbrelOS has not mounted the drive yet');
+          // F10: umbrelOS has not mounted the drive and we cannot synthesize a
+          // replug. Do NOT report success while /mnt/wdexternal is unmounted (Plex
+          // would be dark). Re-mount DIRECTLY by UUID now so Plex keeps serving;
+          // mode stays cooperative, so the monitor hands over to umbrelOS via
+          // ladder A/D once the user's manual replug makes an /External mount
+          // appear. (The direct mount blocks umbreld's automount until then — the
+          // user is told to replug, which drops our mount and lets umbreld win.)
+          this.logLine(wait, 'umbrelOS has not mounted the drive yet; direct-mounting by UUID so Plex keeps serving until you replug');
           wait.state = 'ok';
-          for (const name of ['bind', 'recreate'] as StepName[]) {
-            const s = this.stepOf(job, name);
-            this.logLine(s, 'deferred — waiting for the manual USB replug');
-            s.state = 'skipped';
+          const { view: vDirect } = await backing.classify(settings);
+          const directOk = await backing.doDirectMount(vDirect, settings, (l) => this.logLine(wait, l));
+
+          // The umbrelOS bind is still deferred to the monitor (post-replug).
+          const bindStep = this.stepOf(job, 'bind');
+          this.logLine(bindStep, 'deferred — the monitor will bind to umbrelOS once you replug the USB cable');
+          bindStep.state = 'skipped';
+
+          const rec = this.stepOf(job, 'recreate');
+          if (directOk) {
+            const recreated = await backing.recreate(settings, (l) => this.logLine(rec, l));
+            this.logLine(rec, 'recreated Plex to serve via the direct fallback during the replug wait');
+            rec.state = recreated ? 'ok' : 'failed';
+          } else {
+            this.logLine(rec, 'deferred — waiting for the manual USB replug');
+            rec.state = 'skipped';
           }
+
           const ver = this.beginStep(job, 'verify');
-          this.logLine(ver, 'switch pending: unplug and replug the USB cable; the monitor will bind + restart Plex automatically');
-          ver.state = 'ok';
-          this.finish(
-            job,
-            'Switched to cooperative mode. umbrelOS has not mounted the drive yet — unplug and replug the USB cable; the app will finish binding and restart Plex automatically.',
-            true,
-          );
+          if (directOk) {
+            this.logLine(ver, 'Plex is serving via a direct mount; unplug and replug the USB cable and the app will hand over to umbrelOS + restart Plex automatically');
+            ver.state = 'ok';
+            this.finish(
+              job,
+              'Switched to cooperative mode. umbrelOS has not mounted the drive yet, so Plex is serving via a direct mount for now — unplug and replug the USB cable and the app will finish binding to umbrelOS and restart Plex automatically. (umbrelOS Files may show a Format prompt meanwhile — do NOT format; your data is intact.)',
+              true,
+            );
+          } else {
+            this.logLine(ver, 'could not mount the drive — unplug and replug the USB cable; the app will finish the switch automatically');
+            ver.state = 'failed';
+            this.finish(
+              job,
+              'Switched to cooperative mode but the drive could not be mounted (Plex has no backing). Unplug and replug the USB cable and the app will finish the switch automatically.',
+              false,
+            );
+          }
           return;
         }
         throw new Error('umbrelOS did not mount the drive within the grace window');
