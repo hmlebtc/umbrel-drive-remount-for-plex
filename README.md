@@ -149,6 +149,20 @@ directories with nothing mounted on them, and dead mounts left behind by a devic
 clean, un-suffixed name on remount instead of drifting further with every reconnect. Reaping never touches
 non-empty directories, other drives' folders, or any live mount it doesn't recognize as its own.
 
+Since v0.2.1, a leftover directory that isn't literally empty but whose entire subtree is nothing but empty
+directories (a leftover empty mount-point skeleton, typically) is also safely reclaimable: the app walks the
+whole subtree first and only proceeds if every node in it is a directory - if it finds so much as one file or
+symlink anywhere in the tree, it leaves the whole leftover untouched and flags it on the dashboard
+(`LEFTOVER_HAS_FILES`) for manual review instead. When it does proceed, removal is bottom-up `rmdir` only -
+never a recursive delete - which cannot remove anything but an empty directory, so even a bug in the
+empty-subtree check couldn't lose data. This is what's usually behind umbrelOS drifting the drive's name to
+`<label> (2)` even though nothing looks obviously wrong: a stale, all-empty leftover directory blocking the
+clean name. A **"Reclaim clean name"** button appears on the dashboard when the app detects this drift and
+the leftover is safely reclaimable; it clears the leftover and re-hands the drive to umbrelOS so it remounts
+under the clean, un-suffixed name, restarting Plex once in the process (same auto-revert-to-classic-on-failure
+guarantee as the mode switch above). If the leftover contains real files, the button is replaced by the
+`LEFTOVER_HAS_FILES` note instead, and nothing is deleted automatically.
+
 ### Switching modes
 
 Classic mode remains the default after upgrading to v0.2.0 - nothing changes until you explicitly switch.

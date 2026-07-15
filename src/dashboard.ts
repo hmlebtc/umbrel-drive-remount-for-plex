@@ -332,6 +332,7 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       <button class="btn btn-sm" id="restartPlexBtn" type="button">Restart Plex</button>
       <button class="btn btn-sm amber" id="switchCoopBtn" type="button" style="display:none">Switch to cooperative mode</button>
       <button class="btn btn-sm amber" id="switchClassicBtn" type="button" style="display:none">Switch to classic mode</button>
+      <button class="btn btn-sm" id="reclaimBtn" type="button" style="display:none">Reclaim clean name</button>
       <button class="btn btn-sm" id="checkNowBtn" type="button">Check now</button>
       <button class="btn btn-sm" id="removeLegacyOverrideBtn" type="button" style="display:none">Remove legacy override</button>
       <label class="autoheal-toggle" for="autoHealToggle"><input id="autoHealToggle" type="checkbox"><span>Auto-heal</span></label>
@@ -752,6 +753,14 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
         body: "The stable mount point has no active backing right now, so Plex and umbrelOS Files cannot see the drive until this resolves."
       });
     }
+    if (warnings.indexOf("LEFTOVER_HAS_FILES") !== -1) {
+      var lp = backing && backing.leftoverPath;
+      items.push({
+        level: "amber",
+        title: "Leftover directory contains files — clean name not reclaimable",
+        body: "The directory " + (lp ? lp : "at the clean name") + " contains files, so the clean name cannot be reclaimed automatically. Review and remove it manually to reclaim the clean name. The app never moves, renames, or deletes it."
+      });
+    }
 
     show("warningsBanners", items.length > 0);
     var html = "";
@@ -817,6 +826,17 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
       show("switchCoopBtn", false);
       show("switchClassicBtn", false);
     }
+
+    // Reclaim button (spec section 8): only when bound via umbrelOS, umbreld has
+    // drifted off the clean name, AND the clean name is reclaimable (no leftover
+    // or an all-empty leftover tree). A has-files leftover shows the warning
+    // banner (renderWarnings) instead of the button.
+    var reclaimable =
+      backing &&
+      backing.active === "umbrel-bind" &&
+      backing.driftedName === true &&
+      backing.cleanNameReclaimable === true;
+    show("reclaimBtn", !!reclaimable);
   }
 
   // ---- job render --------------------------------------------------------------
@@ -1154,6 +1174,31 @@ export const DASHBOARD_HTML: string = String.raw`<!doctype html>
     var btn = this;
     var old = busy(btn, "Switching…");
     await doSwitchMode("classic");
+    unbusy(btn, old);
+  });
+
+  // Reclaim clean name (spec section 8): a re-handover that clears the empty
+  // leftover, re-hands the drive to umbrelOS so it remounts under the clean name,
+  // and restarts Plex once. Uses the same cooperative switch-mode job.
+  var RECLAIM_STEPS = [
+    "Clear the empty leftover directory blocking the clean name (only if it is entirely empty — nothing containing files is ever removed)",
+    "Release the current mount and ask umbrelOS to rescan the drive",
+    "umbrelOS remounts the drive under the clean name",
+    "Re-bind our stable mount point to the clean umbrelOS mount",
+    "Plex restarts once to pick up the new bind"
+  ];
+  function confirmReclaim() {
+    var lines = ["This will reclaim the clean umbrelOS name for this drive:"];
+    for (var i = 0; i < RECLAIM_STEPS.length; i++) lines.push((i + 1) + ". " + RECLAIM_STEPS[i]);
+    lines.push("");
+    lines.push("Your media is not touched. Continue?");
+    return window.confirm(lines.join("\n"));
+  }
+  $("reclaimBtn").addEventListener("click", async function () {
+    if (!confirmReclaim()) return;
+    var btn = this;
+    var old = busy(btn, "Reclaiming…");
+    await doSwitchMode("cooperative");
     unbusy(btn, old);
   });
 

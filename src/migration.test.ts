@@ -72,6 +72,26 @@ function stepNames(job: RestoreJob): string[] {
   return job.steps.map((s) => s.name);
 }
 
+const EXTERNAL_BASE = `${defaultSettings().umbrelRoot}/external`;
+
+/**
+ * Put the harness into an ALREADY-cooperative state bound to a drifted "(2)"
+ * umbrelOS mount (the live box before a reclaim): persist cooperative mode and
+ * establish the umbrel-bind record via doBind. Returns the harness.
+ */
+async function setupDriftedBind(scenario: MockScenario): Promise<Harness> {
+  const h = harness(scenario);
+  h.store.update({ mountMode: 'cooperative' });
+  h.backing.setMode('cooperative');
+  const settings = h.store.get();
+  const { view } = await h.backing.classify(settings);
+  assert.ok(view.umbrelMount.path, 'scenario ships a drifted umbrelMount');
+  await h.backing.doBind(view.umbrelMount.path!, view, settings, () => {});
+  const info = await h.backing.driftInfo(h.store.get());
+  assert.equal(info.driftedName, true, 'harness is bound to a drifted "(N)" name');
+  return h;
+}
+
 // ---------------------------------------------------------------------------
 // Happy path — full cooperative switch.
 // ---------------------------------------------------------------------------
@@ -187,6 +207,88 @@ test('switch->classic: from a cooperative bind, reverts to a direct mount and st
     assert.equal(step(job, 'verify'), 'ok', `switch-classic verify not ok: ${job.result}`);
     assert.equal(h.store.get().mountMode, 'classic', 'mountMode persisted back to classic');
     assert.equal(h.backing.getRecord().active, 'direct', 'backing is a direct mount again');
+  } finally {
+    h.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Reclaim clean name (spec §8, v0.2.1) — a re-handover from a drifted "(2)" bind.
+// ---------------------------------------------------------------------------
+
+test('reclaim: drifted "(2)" + empty-tree leftover -> ends bound to the CLEAN name, leftover gone, healthy', async () => {
+  const h = await setupDriftedBind('driftReclaimable');
+  try {
+    // Sanity: we start on the drifted "(2)" name with the leftover present.
+    assert.equal(h.adapter.umbrelMountPath(), `${EXTERNAL_BASE}/wdexternal (2)`);
+
+    const started = h.restore.startSwitch('cooperative'); // re-handover
+    assert.equal(started.ok, true);
+    const job = await waitJob(h.restore);
+
+    assert.equal(step(job, 'reap'), 'ok');
+    assert.equal(step(job, 'bind'), 'ok');
+    assert.equal(step(job, 'verify'), 'ok', `reclaim verify not ok: ${job.result}`);
+
+    // Reclaimed: bound to the CLEAN name; umbreld remounted clean; leftover gone.
+    assert.equal(h.backing.getRecord().boundTo, `${EXTERNAL_BASE}/wdexternal`, 'bound to the clean name');
+    assert.equal(h.adapter.umbrelMountPath(), `${EXTERNAL_BASE}/wdexternal`, 'umbreld mounted at the clean name');
+    assert.equal(
+      await h.adapter.statType(`${EXTERNAL_BASE}/wdexternal/skeleton`),
+      null,
+      'the empty leftover skeleton was cleared',
+    );
+    const info = await h.backing.driftInfo(h.store.get());
+    assert.equal(info.driftedName, false, 'no longer drifted');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('reclaim: drifted "(2)" + has-files leftover -> stays on "(2)", warning surfaced, NOTHING deleted', async () => {
+  const h = await setupDriftedBind('driftHasFiles');
+  try {
+    const filePath = `${EXTERNAL_BASE}/wdexternal/skeleton/movie.mkv`;
+    assert.equal(await h.adapter.statType(filePath), 'file', 'the leftover file exists before');
+
+    h.restore.startSwitch('cooperative');
+    const job = await waitJob(h.restore);
+
+    // The churn is SKIPPED; only verify runs (system healthy on the current mount).
+    for (const n of ['reap', 'unmount', 'rescan', 'wait-umbrel', 'bind', 'recreate']) {
+      assert.equal(step(job, n), 'skipped', `step ${n} should be skipped`);
+    }
+    assert.equal(step(job, 'verify'), 'ok');
+    assert.match(job.result as string, /not reclaimed|contains files|reclaim/i);
+
+    // Still on "(2)"; the file and its tree are entirely untouched.
+    assert.equal(h.backing.getRecord().boundTo, `${EXTERNAL_BASE}/wdexternal (2)`, 'still bound to "(2)"');
+    assert.equal(h.adapter.umbrelMountPath(), `${EXTERNAL_BASE}/wdexternal (2)`);
+    assert.equal(await h.adapter.statType(filePath), 'file', 'the file was NOT deleted');
+
+    // status surfaces LEFTOVER_HAS_FILES with the path.
+    const { backing, warnings } = await h.backing.backingStatus(h.store.get());
+    assert.ok(warnings.includes('LEFTOVER_HAS_FILES'), 'LEFTOVER_HAS_FILES warning surfaced');
+    assert.equal(backing.cleanNameReclaimable, false);
+    assert.equal(backing.leftoverPath, `${EXTERNAL_BASE}/wdexternal`);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('reclaim: a recreate failure mid-reclaim reverts to a direct mount (Plex never dark)', async () => {
+  const h = await setupDriftedBind('driftReclaimable');
+  try {
+    h.adapter.setRecreateFails(true); // docker compose up fails during the reclaim
+
+    h.restore.startSwitch('cooperative');
+    const job = await waitJob(h.restore);
+
+    assert.match(job.result as string, /revert(ed)? to a direct mount/i);
+    assert.equal(h.store.get().mountMode, 'cooperative', 'mode stays cooperative');
+    assert.equal(h.backing.getRecord().active, 'direct', 'backing reverted to a direct mount');
+    const live = await h.backing.deviceLiveMounts(h.store.get());
+    assert.ok(live.includes('/mnt/wdexternal'), 'the stable path is mounted (Plex keeps serving)');
   } finally {
     h.cleanup();
   }

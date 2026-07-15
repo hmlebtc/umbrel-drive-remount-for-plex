@@ -214,6 +214,23 @@ export interface BackingStatus {
   /** Present only while a grace window is counting down. */
   graceRemainingSec?: number;
   reaped: ReapCounts;
+  /**
+   * v0.2.1 (spec §8, reclaim): the bound umbrelMount basename is `<label> (N)`
+   * — umbreld drifted off the clean name because a leftover directory occupies
+   * it. Only meaningful for an active `umbrel-bind`.
+   */
+  driftedName?: boolean;
+  /**
+   * v0.2.1 (spec §8, reclaim): the clean name is reclaimable — there is no
+   * leftover, or the leftover is an all-empty directory tree that can be cleared
+   * losslessly. False when the leftover contains files (see {@link leftoverPath}).
+   */
+  cleanNameReclaimable?: boolean;
+  /**
+   * v0.2.1: the clean-name leftover path when it contains files (drives the
+   * LEFTOVER_HAS_FILES warning's {path}); null/absent otherwise.
+   */
+  leftoverPath?: string | null;
 }
 
 /**
@@ -257,7 +274,13 @@ export interface BackingDecision {
 export type WarningCode =
   | 'FORMAT_DIALOG_EXPECTED'
   | 'EJECTED_IN_UMBREL'
-  | 'WAITING_FOR_UMBREL_MOUNT';
+  | 'WAITING_FOR_UMBREL_MOUNT'
+  /**
+   * v0.2.1 (spec §4/§8): the clean-name leftover directory contains files, so it
+   * cannot be cleared to reclaim the clean name. We NEVER move/rename/delete it;
+   * the path is surfaced via status.backing.leftoverPath.
+   */
+  | 'LEFTOVER_HAS_FILES';
 
 export interface AppStatus {
   timestamp: string;

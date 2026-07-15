@@ -20,9 +20,9 @@ import { backingDecide, classifyBacking, parseMountInfo } from './backing.js';
 import type { EventLog } from './events.js';
 import type { HostAdapter } from './hostAdapter.js';
 import { findMount, parseProcMounts } from './mounts.js';
-import { byUuidPath, externalBase } from './paths.js';
+import { byUuidPath, externalBase, sanitizeLabel } from './paths.js';
 import { probeLiveOk, recreatePlex } from './plex.js';
-import { reapPlan, type ReapEntry } from './reap.js';
+import { classifyLeftover, matchesLabel, reapPlan, type LeafScan, type ReapEntry } from './reap.js';
 import type {
   AppStatus,
   BackingDecision,
@@ -42,6 +42,21 @@ const NOOP_LOG: LogSink = () => {};
 
 /** Cap the number of externalBase entries considered per reap (bounded, section 4). */
 const REAP_SCAN_LIMIT = 64;
+
+/**
+ * Bounds for the recursive leftover-subtree walk (spec §4, v0.2.1). Hitting
+ * either cap means we could NOT fully prove the tree empty, so it is treated as
+ * has-files and never auto-cleared. `<externalBase>/<label>` skeletons are a
+ * handful of empty dirs; these caps only ever fire on an unexpectedly large tree.
+ */
+const SCAN_DEPTH_CAP = 12;
+const SCAN_NODE_CAP = 5000;
+
+/** Bounds for {@link BackingEngine.scanLeftover} (defaults to the §4 caps). */
+export interface ScanBounds {
+  depthCap?: number;
+  nodeCap?: number;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -472,6 +487,87 @@ export class BackingEngine {
     return explicit !== '' ? explicit : posix.basename(settings.mountPoint);
   }
 
+  /**
+   * Recursively walk a leftover subtree via listDir + statType (spec §4,
+   * v0.2.1), returning the descendant node list {@link classifyLeftover}
+   * consumes. Bounded by depth (12) and node count (5000); on hitting EITHER cap,
+   * or on an unreadable directory (can't prove empty), a non-directory sentinel
+   * node is appended so the tree classifies as has-files — we never auto-clear
+   * what we could not fully verify empty. statType (lstat) makes a symlink read
+   * as 'symlink' (never dereferenced), so a symlink to a directory is a file, not
+   * an empty dir. The walk is strictly scoped to `dir` and its descendants.
+   */
+  async scanLeftover(dir: string, bounds: ScanBounds = {}): Promise<LeafScan> {
+    const depthCap = bounds.depthCap ?? SCAN_DEPTH_CAP;
+    const nodeCap = bounds.nodeCap ?? SCAN_NODE_CAP;
+    const nodes: LeafScan = [];
+    const stack: { path: string; depth: number }[] = [{ path: dir, depth: 0 }];
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      const names = await this.adapter.listDir(cur.path);
+      if (names === null) {
+        // Unreadable / not a directory: we cannot prove it empty -> has-files.
+        nodes.push({ path: cur.path, type: 'other' });
+        return nodes;
+      }
+      for (const name of names) {
+        if (nodes.length >= nodeCap) {
+          nodes.push({ path: cur.path, type: 'other' }); // node cap -> has-files
+          return nodes;
+        }
+        const child = posix.join(cur.path, name);
+        const type = await this.adapter.statType(child);
+        if (type === null) continue; // vanished between listDir and statType
+        nodes.push({ path: child, type });
+        if (type === 'dir') {
+          if (cur.depth + 1 >= depthCap) {
+            nodes.push({ path: child, type: 'other' }); // depth cap -> has-files
+            return nodes;
+          }
+          stack.push({ path: child, depth: cur.depth + 1 });
+        }
+      }
+    }
+    return nodes;
+  }
+
+  /**
+   * Bottom-up (deepest-first) rmdir of an all-empty leftover tree (spec §4,
+   * v0.2.1). Two independent data-safety guarantees:
+   *   1. pre-check — re-scans the tree and REFUSES unless it is empty-tree, and
+   *   2. execution — removal is `adapter.removeDir` (rmdir, NON-recursive), which
+   *      physically cannot delete a file or a non-empty directory.
+   * Aborts (returns false, nothing further removed) if ANY rmdir fails. Strictly
+   * scoped to `dir` and its descendants — never ascends or escapes.
+   */
+  async clearEmptyTree(dir: string, log: LogSink = NOOP_LOG): Promise<boolean> {
+    const scan = await this.scanLeftover(dir);
+    if (classifyLeftover(scan) !== 'empty-tree') {
+      log(`clearEmptyTree refused ${dir}: subtree is not all-empty-directories (contains files)`);
+      return false;
+    }
+    // Every directory to remove: the descendants (all dirs, since empty-tree) plus
+    // the root itself, deepest-first so children go before parents.
+    const targets = scan.filter((n) => n.type === 'dir').map((n) => n.path);
+    targets.push(dir);
+    targets.sort((a, b) => b.split('/').length - a.split('/').length);
+    const prefix = `${dir}/`;
+    for (const target of targets) {
+      // Scope rail: refuse anything not equal to / under the matched leftover dir.
+      if (target !== dir && !target.startsWith(prefix)) {
+        log(`clearEmptyTree aborted: ${target} is outside the scoped leftover ${dir}`);
+        return false;
+      }
+      try {
+        await this.adapter.removeDir(target); // rmdir — fails on any non-empty dir
+      } catch (e) {
+        log(`clearEmptyTree aborted: rmdir ${target} failed: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
+      }
+    }
+    return true;
+  }
+
   async reap(settings: Settings, log: LogSink = NOOP_LOG): Promise<ReapCounts> {
     const base = externalBase(settings);
     const names = await this.adapter.listDir(base);
@@ -487,6 +583,9 @@ export class BackingEngine {
 
     const label = this.reapLabel(settings);
     const listing: ReapEntry[] = [];
+    // Label-matched, UNMOUNTED, NON-empty leftovers: candidates for the v0.2.1
+    // empty-tree clear (an unmounted dir can never be the active umbrelMount).
+    const nonEmptyLeftovers: string[] = [];
     for (const name of names.slice(0, REAP_SCAN_LIMIT)) {
       const dirPath = posix.join(base, name);
       const mountEntry = mountedAt.get(dirPath) ?? null;
@@ -501,6 +600,9 @@ export class BackingEngine {
       // source present and must never be torn down.
       const sourcePresent = source !== null ? await this.adapter.exists(source) : false;
       listing.push({ name, empty, mounted, source, sourcePresent });
+      if (!mounted && !empty && contents !== null && matchesLabel(name, label)) {
+        nonEmptyLeftovers.push(dirPath);
+      }
     }
 
     const plan = reapPlan(listing, label);
@@ -526,6 +628,24 @@ export class BackingEngine {
         this.activity('info', `reaped leftover directory ${target}`);
       } catch (e) {
         log(`reap rmdir ${target} skipped: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // v0.2.1: a label-matched, unmounted, NON-empty leftover (e.g. an empty
+    // mount-point skeleton blocking the clean name) -> scan its subtree. An
+    // all-empty tree is cleared bottom-up via rmdir (counts as a reaped dir); a
+    // subtree containing ANY file is LEFT untouched (the LEFTOVER_HAS_FILES
+    // warning is surfaced by backingStatus).
+    for (const dirPath of nonEmptyLeftovers) {
+      const scan = await this.scanLeftover(dirPath);
+      if (classifyLeftover(scan) === 'empty-tree') {
+        if (await this.clearEmptyTree(dirPath, log)) {
+          dirs++;
+          log(`reaped empty leftover tree: ${dirPath}`);
+          this.activity('info', `reaped empty leftover directory tree ${dirPath}`);
+        }
+      } else {
+        log(`leftover ${dirPath} contains files — leaving untouched (review to reclaim the clean name)`);
       }
     }
 
@@ -637,6 +757,63 @@ export class BackingEngine {
     return null;
   }
 
+  // --- reclaim / name-drift (spec §8, v0.2.1) ------------------------------
+
+  /** True when `path`'s basename is `<label> (N)` — umbreld's drifted name. */
+  private isDriftedBasename(path: string, label: string): boolean {
+    const sanitized = sanitizeLabel(label);
+    if (sanitized === '') return false;
+    const base = posix.basename(path);
+    return new RegExp(`^${escapeRegExp(sanitized)} \\(\\d+\\)$`).test(base);
+  }
+
+  /**
+   * Compute the reclaim flags for an already-classified cooperative view: is the
+   * bound umbrelMount on a drifted `<label> (N)` name, and is the clean name
+   * reclaimable (no leftover, or an all-empty leftover tree)? Scans the clean-name
+   * leftover ONLY when drifted (so the common healthy path adds no I/O). A leftover
+   * that contains files is not reclaimable and yields its path (the warning's {path}).
+   */
+  private async computeDriftInfo(
+    settings: Settings,
+    view: BackingView,
+    active: BackingStatus['active'],
+  ): Promise<{ driftedName: boolean; cleanNameReclaimable: boolean; leftoverPath: string | null }> {
+    const boundPath = view.umbrelMount.path;
+    const driftedName =
+      active === 'umbrel-bind' && boundPath !== null && this.isDriftedBasename(boundPath, this.reapLabel(settings));
+    if (!driftedName) return { driftedName: false, cleanNameReclaimable: false, leftoverPath: null };
+
+    const cleanPath = posix.join(externalBase(settings), sanitizeLabel(this.reapLabel(settings)));
+    const type = await this.adapter.statType(cleanPath);
+    if (type === null) return { driftedName: true, cleanNameReclaimable: true, leftoverPath: null }; // nothing blocking
+    if (type !== 'dir') return { driftedName: true, cleanNameReclaimable: false, leftoverPath: cleanPath };
+    const scan = await this.scanLeftover(cleanPath);
+    if (classifyLeftover(scan) === 'empty-tree') {
+      return { driftedName: true, cleanNameReclaimable: true, leftoverPath: null };
+    }
+    return { driftedName: true, cleanNameReclaimable: false, leftoverPath: cleanPath };
+  }
+
+  /**
+   * Public reclaim probe for the switch runner: classify, derive the active
+   * backing, then compute the drift/reclaim flags. Cheap in the common case
+   * (only scans a subtree when actually drifted).
+   */
+  async driftInfo(
+    settings: Settings,
+  ): Promise<{ driftedName: boolean; cleanNameReclaimable: boolean; leftoverPath: string | null; umbrelMountPath: string | null }> {
+    if ((settings.mountMode ?? 'classic') !== 'cooperative') {
+      return { driftedName: false, cleanNameReclaimable: false, leftoverPath: null, umbrelMountPath: null };
+    }
+    const { view } = await this.classify(settings);
+    let active: BackingStatus['active'] = 'none';
+    if (view.stablePath.bindOfUmbrel && !view.stablePath.stale) active = 'umbrel-bind';
+    else if (view.stablePath.direct && !view.stablePath.stale) active = 'direct';
+    const d = await this.computeDriftInfo(settings, view, active);
+    return { ...d, umbrelMountPath: view.umbrelMount.path };
+  }
+
   // --- status (spec section 8) ---------------------------------------------
 
   /**
@@ -702,6 +879,10 @@ export class BackingEngine {
       warnings.push('FORMAT_DIALOG_EXPECTED');
     }
 
+    // v0.2.1 reclaim flags: is umbreld drifted off the clean name, and can we
+    // reclaim it? Surfaces LEFTOVER_HAS_FILES when the leftover contains files.
+    const drift = await this.computeDriftInfo(settings, view, active);
+
     const backing: BackingStatus = {
       mode,
       active,
@@ -713,7 +894,13 @@ export class BackingEngine {
       bindGeneration: rec.bindGeneration,
       lastBindChangeAt: rec.lastBindChangeAt,
       reaped: { ...this.reaped },
+      driftedName: drift.driftedName,
+      cleanNameReclaimable: drift.cleanNameReclaimable,
     };
+    if (drift.leftoverPath !== null) backing.leftoverPath = drift.leftoverPath;
+    if (drift.driftedName && !drift.cleanNameReclaimable && drift.leftoverPath !== null) {
+      warnings.push('LEFTOVER_HAS_FILES');
+    }
     if (graceRemainingSec > 0) backing.graceRemainingSec = graceRemainingSec;
     return { backing, warnings };
   }

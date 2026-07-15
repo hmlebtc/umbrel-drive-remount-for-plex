@@ -57,6 +57,45 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ---------------------------------------------------------------------------
+// Leftover-subtree classification (spec §4, v0.2.1) — PURE.
+//
+// The safety principle: we only ever auto-clear a leftover whose ENTIRE subtree
+// is empty DIRECTORIES (deleting empty dirs is lossless by definition). A single
+// regular file / symlink / socket / device ANYWHERE in the tree makes it
+// has-files: we leave it untouched and surface a warning.
+// ---------------------------------------------------------------------------
+
+/** One node from a recursive walk of a leftover subtree. */
+export interface LeafNode {
+  path: string;
+  type: 'file' | 'dir' | 'symlink' | 'other';
+}
+
+/** The recursively-gathered node list for one leftover subtree (descendants). */
+export type LeafScan = LeafNode[];
+
+/**
+ * Classify a leftover subtree from its recursive node scan.
+ *
+ *   'empty-tree' — every node is a directory (zero files/symlinks/other,
+ *                  anywhere): safe to clear via bottom-up rmdir (lossless).
+ *   'has-files'  — ANY non-directory node exists: NEVER touched.
+ *
+ * An over-cap scan (too deep / too many nodes to fully prove empty) is expressed
+ * by the scanner appending a non-directory sentinel node, so it classifies as
+ * has-files here — we never auto-clear what we could not fully verify.
+ *
+ * `is-mount` is handled upstream (a mounted directory is never passed here), so
+ * this pure function only ever returns 'empty-tree' or 'has-files'.
+ */
+export function classifyLeftover(scan: LeafScan): 'empty-tree' | 'has-files' | 'is-mount' {
+  for (const node of scan) {
+    if (node.type !== 'dir') return 'has-files';
+  }
+  return 'empty-tree';
+}
+
 /**
  * Plan the reap actions for a directory listing under externalBase.
  *

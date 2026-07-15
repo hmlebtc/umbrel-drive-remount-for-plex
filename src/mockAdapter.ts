@@ -58,7 +58,12 @@ export type MockScenario =
   | 'leftoverDirs'
   | 'plexStartedBeforeBind'
   // v0.2.0 fix-hardening hazards (adversarial review F1/F2).
-  | 'siblingPartitionMounted';
+  | 'siblingPartitionMounted'
+  // v0.2.1 reclaim scenarios: umbreld drifted to "(2)" behind a leftover at the
+  // clean name — an all-empty directory tree (reclaimable) vs. one with a file
+  // at depth (has-files; never cleared).
+  | 'driftReclaimable'
+  | 'driftHasFiles';
 
 /**
  * Test-facing controls to drive the umbreld simulation deterministically. These
@@ -95,6 +100,13 @@ export interface MockControl {
   setMountSilentlyFails(fails: boolean): void;
   /** Add a directory under the external base (name + whether it holds non-mount files). */
   addExternalDir(name: string, hasFiles?: boolean): void;
+  /**
+   * v0.2.1: add a node at an absolute path INSIDE the external subtree (a nested
+   * directory or a file/symlink/other at depth), so a leftover can model an
+   * empty-directory tree or one with a real file. The parent chain is created as
+   * directories automatically.
+   */
+  addSubtreeNode(absPath: string, type: 'dir' | 'file' | 'symlink' | 'other'): void;
 }
 
 export interface MockHostAdapter extends HostAdapter, MockControl {
@@ -185,6 +197,10 @@ function normalizeScenario(raw: string): MockScenario | null {
     plexstartedbeforebind: 'plexStartedBeforeBind',
     'sibling-partition-mounted': 'siblingPartitionMounted',
     siblingpartitionmounted: 'siblingPartitionMounted',
+    'drift-reclaimable': 'driftReclaimable',
+    driftreclaimable: 'driftReclaimable',
+    'drift-has-files': 'driftHasFiles',
+    drifthasfiles: 'driftHasFiles',
   };
   return map[key] ?? null;
 }
@@ -231,6 +247,13 @@ interface MockState {
   files: Map<string, string>;
   /** Directories under <externalBase>: name (absolute) -> hasFiles (non-mount contents). */
   externalDirs: Map<string, boolean>;
+  /**
+   * v0.2.1: nodes STRICTLY BELOW a direct child of <externalBase> (grandchildren
+   * and deeper) — absolute path -> node type. Direct children live in
+   * {@link externalDirs}; this models the nested leftover trees the recursive
+   * scan (statType + listDir) walks.
+   */
+  subtree: Map<string, 'dir' | 'file' | 'symlink' | 'other'>;
   container: {
     exists: boolean;
     running: boolean;
@@ -333,6 +356,7 @@ class MockHostAdapterImpl implements MockHostAdapter {
         [legacyOverridePath(this.s), LEGACY_OVERRIDE],
       ]),
       externalDirs: new Map<string, boolean>(),
+      subtree: new Map<string, 'dir' | 'file' | 'symlink' | 'other'>(),
       container: {
         exists: true,
         running: true,
@@ -385,7 +409,9 @@ class MockHostAdapterImpl implements MockHostAdapter {
       scenario === 'bindStaleAfterReplug' ||
       scenario === 'leftoverDirs' ||
       scenario === 'plexStartedBeforeBind' ||
-      scenario === 'siblingPartitionMounted'
+      scenario === 'siblingPartitionMounted' ||
+      scenario === 'driftReclaimable' ||
+      scenario === 'driftHasFiles'
     );
   }
 
@@ -565,6 +591,36 @@ class MockHostAdapterImpl implements MockHostAdapter {
         state.container.view = null;
         break;
       }
+      case 'driftReclaimable': {
+        // Cooperative box drifted to "(2)" because a leftover EMPTY-TREE dir
+        // (an empty mount-point skeleton, one empty subdir) occupies the clean
+        // name. umbreld is mounted at "(2)". The app's cooperative bind is NOT
+        // pre-shipped — the reclaim test establishes it via doBind — so classify
+        // sees exactly the live box: one /External mount at "(2)" + the leftover.
+        // The drive is a SEPARATE USB disk (sdc) from the root disk (sda) so the
+        // reclaim's whole-disk sysfs replug is not falsely vetoed by the root fs.
+        state.uuidDevice = '/dev/sdc1';
+        state.disk = 'sdc';
+        state.externalDirs.set(`${base}/${label}`, false); // leftover dir...
+        state.subtree.set(`${base}/${label}/skeleton`, 'dir'); // ...with one empty subdir (empty-tree)
+        const um = this.umbrelMountAt(state, `${label} (2)`);
+        state.mounts = [um];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
+      case 'driftHasFiles': {
+        // As driftReclaimable, but the leftover holds a FILE at depth — it is
+        // has-files and must NEVER be cleared; the clean name stays unreclaimable.
+        state.uuidDevice = '/dev/sdc1';
+        state.disk = 'sdc';
+        state.externalDirs.set(`${base}/${label}`, false);
+        state.subtree.set(`${base}/${label}/skeleton`, 'dir');
+        state.subtree.set(`${base}/${label}/skeleton/movie.mkv`, 'file'); // a real file at depth
+        const um = this.umbrelMountAt(state, `${label} (2)`);
+        state.mounts = [um];
+        state.container.view = Object.keys(state.deviceFolders);
+        break;
+      }
       case 'plexStartedBeforeBind': {
         // Backing looks correct (umbrel mount + our bind, host media visible) but
         // Plex started BEFORE the bind, so its in-container view is empty/dead.
@@ -661,6 +717,40 @@ class MockHostAdapterImpl implements MockHostAdapter {
     this.state.externalDirs.set(`${this.externalBase()}/${name}`, hasFiles);
   }
 
+  addSubtreeNode(absPath: string, type: 'dir' | 'file' | 'symlink' | 'other'): void {
+    this.state.subtree.set(absPath, type);
+    // Materialize the parent chain as directories down to a direct child of the
+    // external base (which lives in externalDirs), so listDir/statType are coherent.
+    const base = this.externalBase();
+    let parent = absPath.slice(0, absPath.lastIndexOf('/'));
+    while (parent.startsWith(`${base}/`)) {
+      const rel = parent.slice(base.length + 1);
+      if (!rel.includes('/')) {
+        if (!this.state.externalDirs.has(parent)) this.state.externalDirs.set(parent, false);
+        break;
+      }
+      if (this.state.subtree.get(parent) !== 'dir') this.state.subtree.set(parent, 'dir');
+      parent = parent.slice(0, parent.lastIndexOf('/'));
+    }
+  }
+
+  /** Immediate child basenames of a modeled external directory (from the subtree). */
+  private immediateChildren(path: string): string[] {
+    const prefix = `${path}/`;
+    const out: string[] = [];
+    for (const key of this.state.subtree.keys()) {
+      if (key.startsWith(prefix) && !key.slice(prefix.length).includes('/')) {
+        out.push(key.slice(prefix.length));
+      }
+    }
+    return out;
+  }
+
+  /** True when `path` is a modeled external directory (direct child or nested). */
+  private isModeledDir(path: string): boolean {
+    return this.state.externalDirs.has(path) || this.state.subtree.get(path) === 'dir';
+  }
+
   /**
    * Is a /dev/* device node present on the system? True for the by-uuid device
    * (when attached), the root device, and any explicitly-added extra device
@@ -747,13 +837,28 @@ class MockHostAdapterImpl implements MockHostAdapter {
    */
   async removeDir(hostPath: string): Promise<void> {
     const state = this.state;
-    if (!state.externalDirs.has(hostPath)) return; // ENOENT -> no-op
+    const isDir = state.externalDirs.has(hostPath) || state.subtree.get(hostPath) === 'dir';
+    if (!isDir) return; // ENOENT (or not-a-directory) -> no-op
     const occupiedByMount = state.mounts.some((m) => m.target === hostPath);
-    const hasFiles = state.externalDirs.get(hostPath) === true;
-    if (occupiedByMount || hasFiles) {
+    const hasChildren = this.immediateChildren(hostPath).length > 0; // nested contents
+    const legacyHasFiles = state.externalDirs.get(hostPath) === true; // flat "non-empty" flag
+    if (occupiedByMount || hasChildren || legacyHasFiles) {
       throw Object.assign(new Error(`ENOTEMPTY: directory not empty, rmdir '${hostPath}'`), { code: 'ENOTEMPTY' });
     }
     state.externalDirs.delete(hostPath);
+    state.subtree.delete(hostPath);
+  }
+
+  /**
+   * lstat-based node type (v0.2.1): a modeled external directory -> 'dir'; a
+   * nested file/symlink/other -> its type; anything else -> null (ENOENT). Does
+   * NOT follow symlinks (a subtree 'symlink' stays 'symlink').
+   */
+  async statType(hostPath: string): Promise<'file' | 'dir' | 'symlink' | 'other' | null> {
+    if (hostPath === this.externalBase()) return 'dir';
+    if (this.state.externalDirs.has(hostPath)) return 'dir';
+    const t = this.state.subtree.get(hostPath);
+    return t ?? null;
   }
 
   async exists(hostPath: string): Promise<boolean> {
@@ -761,6 +866,7 @@ class MockHostAdapterImpl implements MockHostAdapter {
     // /dev/* device-node presence (F1 reap source-present check).
     if (/^\/dev\//.test(hostPath)) return this.deviceIsPresent(hostPath);
     if (this.state.externalDirs.has(hostPath)) return true;
+    if (this.state.subtree.has(hostPath)) return true; // nested leftover nodes (v0.2.1)
     // sysfs USB device dir attributes the replug walk (sysfsReplug) looks for.
     if (hostPath === `${USB_DEVICE_DIR}/authorized` || hostPath === `${USB_DEVICE_DIR}/idVendor`) {
       return this.state.replugAvailable;
@@ -799,6 +905,12 @@ class MockHostAdapterImpl implements MockHostAdapter {
       this.state.mounts.some((m) => m.target === hostPath && this.isDead(m))
     ) {
       return null;
+    }
+
+    // v0.2.1: a modeled external directory (an unmounted leftover dir or a nested
+    // dir) lists its immediate subtree children — [] for an empty dir.
+    if (this.isModeledDir(hostPath)) {
+      return this.immediateChildren(hostPath);
     }
 
     if (!this.isUnderMount(hostPath) || !this.mountedActive()) {

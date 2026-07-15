@@ -643,18 +643,58 @@ class RestoreRunnerImpl implements RestoreRunner {
     this.logLine(setMode, 'mountMode set to cooperative');
     setMode.state = 'ok';
 
+    // v0.2.1 reclaim: when we are ALREADY cooperative and bound to a drifted
+    // "<label> (N)" name, this switch is a RE-HANDOVER to reclaim the clean name.
+    const drift = await backing.driftInfo(settings);
+    const reclaiming = drift.driftedName;
+    if (reclaiming && !drift.cleanNameReclaimable) {
+      // The leftover at the clean name contains FILES: SKIP the destructive-adjacent
+      // churn, stay on the current "(N)" mount, and surface LEFTOVER_HAS_FILES.
+      // We never move, rename, or delete the leftover.
+      for (const n of ['reap', 'unmount', 'rescan', 'wait-umbrel', 'bind', 'recreate'] as StepName[]) {
+        const s = this.stepOf(job, n);
+        this.logLine(s, 'skipped: the leftover directory at the clean name contains files — nothing is cleared');
+        s.state = 'skipped';
+      }
+      const ver = this.beginStep(job, 'verify');
+      status = await this.probeWithBacking(settings);
+      if (restoreHealthy(status, settings)) {
+        this.logLine(ver, `clean name not reclaimable (leftover ${drift.leftoverPath ?? ''} contains files); staying on the current mount — nothing deleted`);
+        ver.state = 'ok';
+        this.finish(
+          job,
+          `Clean name not reclaimed: the leftover directory${drift.leftoverPath ? ` ${drift.leftoverPath}` : ''} contains files. Staying on the current mount — review and remove it manually to reclaim the clean name. Nothing was deleted.`,
+          true,
+        );
+      } else {
+        this.logLine(ver, `still unhealthy: ${collectProblems(status)}`);
+        ver.state = 'failed';
+        this.finish(job, `Reclaim skipped (leftover has files) but the system is still unhealthy: ${collectProblems(status)}`, false);
+      }
+      return;
+    }
+
     // Everything past here is reversible; any failure reverts to a direct mount.
     try {
-      // --- step 2: reap ----------------------------------------------------
+      // --- step 2: reap (also clears an empty-tree leftover blocking the clean
+      // name, freeing it for umbreld to reuse on the remount below) -----------
       const reap = this.beginStep(job, 'reap');
       const reaped = await backing.reap(settings, (l) => this.logLine(reap, l));
       this.logLine(reap, `reaped ${reaped.dirs} leftover dir(s), ${reaped.mounts} dead mount(s)`);
       reap.state = 'ok';
 
       // --- step 3: unmount OUR stable-path mount (section-10 rail: we only
-      // ever umount /mnt/wdexternal here — never an arbitrary device mount) ---
+      // ever umount /mnt/wdexternal here — never an arbitrary device mount).
+      // On a reclaim we ALSO release umbreld's drifted "(N)" mount of our device
+      // so the disk holds zero live mounts and umbreld can remount at the freed
+      // clean name (the whole-disk sysfs veto below stays intact — it now passes
+      // because we released cleanly first). --------------------------------
       const unmount = this.beginStep(job, 'unmount');
       await backing.lazyUmount(settings.mountPoint, (l) => this.logLine(unmount, l));
+      if (reclaiming && drift.umbrelMountPath !== null) {
+        this.logLine(unmount, `reclaim: releasing umbreld's drifted mount ${drift.umbrelMountPath} so the disk frees for a clean remount`);
+        await backing.lazyUmount(drift.umbrelMountPath, (l) => this.logLine(unmount, l));
+      }
       const live = await backing.deviceLiveMounts(settings);
       this.logLine(unmount, `device now holds ${live.length} live mount(s) after unmounting ${settings.mountPoint}`);
       unmount.state = 'ok';

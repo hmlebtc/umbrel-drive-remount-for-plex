@@ -145,6 +145,67 @@ test('mock removeDir: a non-existent dir is a no-op (ENOENT)', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v0.2.1: nested leftover trees + statType + nested removeDir semantics.
+// ---------------------------------------------------------------------------
+
+test('mock statType: dir / file / symlink / other / null (ENOENT), never dereferencing symlinks', async () => {
+  const a = createMockAdapter('coopHealthy');
+  a.addExternalDir('leftover', false);
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/sub`, 'dir');
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/sub/movie.mkv`, 'file');
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/sub/link`, 'symlink');
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/sub/sock`, 'other');
+
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover`), 'dir');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover/sub`), 'dir');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover/sub/movie.mkv`), 'file');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover/sub/link`), 'symlink', 'symlink is not dereferenced');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover/sub/sock`), 'other');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/leftover/nope`), null, 'missing -> null');
+});
+
+test('mock listDir: a nested leftover directory lists its immediate children; an empty dir lists []', async () => {
+  const a = createMockAdapter('coopHealthy');
+  a.addExternalDir('leftover', false);
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/a`, 'dir');
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/a/deep`, 'dir');
+
+  assert.deepEqual((await a.listDir(`${EXTERNAL_BASE}/leftover`))!.sort(), ['a']);
+  assert.deepEqual(await a.listDir(`${EXTERNAL_BASE}/leftover/a`), ['deep']);
+  assert.deepEqual(await a.listDir(`${EXTERNAL_BASE}/leftover/a/deep`), [], 'a leaf empty dir lists []');
+});
+
+test('mock removeDir: rmdir-only on a nested tree — fails on a non-empty dir, succeeds once emptied', async () => {
+  const a = createMockAdapter('coopHealthy');
+  a.addExternalDir('leftover', false);
+  a.addSubtreeNode(`${EXTERNAL_BASE}/leftover/a`, 'dir');
+
+  // The parent still holds a child -> ENOTEMPTY.
+  await assert.rejects(() => a.removeDir(`${EXTERNAL_BASE}/leftover`), /ENOTEMPTY/);
+  // Remove the (empty) child first, then the parent removes cleanly.
+  await a.removeDir(`${EXTERNAL_BASE}/leftover/a`);
+  await a.removeDir(`${EXTERNAL_BASE}/leftover`);
+  assert.ok(!(await a.listDir(EXTERNAL_BASE))!.includes('leftover'));
+});
+
+test('mock removeDir: a dir holding a FILE at depth can never be rmdir-ed (data-safety)', async () => {
+  const a = createMockAdapter('driftHasFiles');
+  const leftover = `${EXTERNAL_BASE}/wdexternal`;
+  // The skeleton holds a file, so neither the skeleton nor the leftover rmdir.
+  await assert.rejects(() => a.removeDir(`${leftover}/skeleton`), /ENOTEMPTY/);
+  await assert.rejects(() => a.removeDir(leftover), /ENOTEMPTY/);
+  assert.equal(await a.statType(`${leftover}/skeleton/movie.mkv`), 'file', 'the file is untouched');
+});
+
+test('mock: driftReclaimable ships drifted to "(2)" with an empty-tree leftover at the clean name', async () => {
+  const a = createMockAdapter('driftReclaimable');
+  assert.equal(a.umbrelMountPath(), `${EXTERNAL_BASE}/wdexternal (2)`);
+  assert.ok((await a.listDir(EXTERNAL_BASE))!.includes('wdexternal'), 'the clean-name leftover is present');
+  assert.equal(await a.statType(`${EXTERNAL_BASE}/wdexternal/skeleton`), 'dir', 'an empty subdir (empty-tree)');
+  assert.deepEqual(await a.listDir(`${EXTERNAL_BASE}/wdexternal/skeleton`), [], 'the skeleton is empty');
+});
+
+// ---------------------------------------------------------------------------
 // docker-exec in-container liveness (the plex-started-before-bind crux, §5).
 // ---------------------------------------------------------------------------
 

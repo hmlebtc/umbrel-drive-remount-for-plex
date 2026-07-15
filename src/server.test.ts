@@ -37,11 +37,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 
-import { createMockAdapter } from "./mockAdapter.js";
+import { createMockAdapter, type MockScenario } from "./mockAdapter.js";
 import type { ExecOptions, ExecResult, HostAdapter, PlexInspect } from "./hostAdapter.js";
 import { createRestoreRunner } from "./restore.js";
 import { defaultSettings, SettingsStore } from "./settings.js";
 import { createApiServer, type AppContext } from "./server.js";
+import { BackingEngine } from "./backingEngine.js";
+import { EventLog } from "./events.js";
 
 interface Harness {
   ctx: AppContext;
@@ -65,6 +67,50 @@ function buildCtx(opts: { mock?: boolean } = {}): Harness {
     dataDir: dir,
   };
   return { ctx, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+interface CoopHarness {
+  ctx: AppContext;
+  backing: BackingEngine;
+  adapter: ReturnType<typeof createMockAdapter>;
+  settings: SettingsStore;
+  cleanup: () => void;
+}
+
+/**
+ * A server context wired with the cooperative BackingEngine (as main.ts does),
+ * over a chosen mock scenario. A tiny grace (1s) via the getSettings wrapper keeps
+ * any switch-mode job's wait-for-umbrel bounded. Establishes the umbrel-bind record
+ * so status.backing reflects a real drifted cooperative bind.
+ */
+function buildCoopCtx(scenario: MockScenario): CoopHarness {
+  const dir = mkdtempSync(join(tmpdir(), "drp-coop-"));
+  const settings = new SettingsStore(dir, { ...defaultSettings(), mountMode: "cooperative" });
+  const getSettings = () => ({ ...settings.get(), graceSec: 1 });
+  const adapter = createMockAdapter(scenario);
+  const events = new EventLog();
+  const backing = new BackingEngine(adapter, getSettings, events, dir);
+  const restore = createRestoreRunner(adapter, getSettings, events, dir, { backing, settings });
+  const ctx: AppContext = {
+    adapter,
+    settings,
+    restore,
+    backing,
+    events,
+    mock: true,
+    startedAt: new Date().toISOString(),
+    version: "0.2.1",
+    gitSha: "test-sha",
+    dataDir: dir,
+  };
+  return { ctx, backing, adapter, settings, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+/** Establish the cooperative umbrel-bind record by binding to the live umbrelMount. */
+async function establishDriftedBind(h: CoopHarness): Promise<void> {
+  const s = h.settings.get();
+  const { view } = await h.backing.classify(s);
+  await h.backing.doBind(view.umbrelMount.path!, view, s, () => {});
 }
 
 async function withServer<T>(ctx: AppContext, fn: (baseUrl: string) => Promise<T>): Promise<T> {
@@ -167,6 +213,9 @@ class GatedFirstExistsAdapter implements HostAdapter {
   }
   listDir(hostPath: string): Promise<string[] | null> {
     return this.base.listDir(hostPath);
+  }
+  statType(hostPath: string): Promise<'file' | 'dir' | 'symlink' | 'other' | null> {
+    return this.base.statType(hostPath);
   }
   realpath(hostPath: string): Promise<string | null> {
     return this.base.realpath(hostPath);
@@ -524,6 +573,72 @@ test("POST /api/switch-mode: without confirm:true -> 400 (confirm gate)", async 
     });
   } finally {
     cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Reclaim gating flags (spec §8) on /api/status.backing + switch-mode allowed
+// when ALREADY cooperative (the re-handover trigger).
+// ---------------------------------------------------------------------------
+
+test("GET /api/status: a drifted reclaimable bind reports driftedName + cleanNameReclaimable true, no LEFTOVER warning", async () => {
+  const h = buildCoopCtx("driftReclaimable");
+  try {
+    await establishDriftedBind(h);
+    await withServer(h.ctx, async (baseUrl) => {
+      const { body } = await getJSON(baseUrl, "/api/status");
+      const b = body.data.backing;
+      assert.equal(b.active, "umbrel-bind");
+      assert.equal(b.driftedName, true, "bound to a drifted <label> (N) name");
+      assert.equal(b.cleanNameReclaimable, true, "empty-tree leftover -> reclaimable (button shows)");
+      assert.ok(
+        !(body.data.warnings || []).includes("LEFTOVER_HAS_FILES"),
+        "no has-files warning when reclaimable",
+      );
+    });
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("GET /api/status: a drifted has-files bind reports cleanNameReclaimable false + LEFTOVER_HAS_FILES", async () => {
+  const h = buildCoopCtx("driftHasFiles");
+  try {
+    await establishDriftedBind(h);
+    await withServer(h.ctx, async (baseUrl) => {
+      const { body } = await getJSON(baseUrl, "/api/status");
+      const b = body.data.backing;
+      assert.equal(b.driftedName, true);
+      assert.equal(b.cleanNameReclaimable, false, "has-files leftover -> NOT reclaimable (no button)");
+      assert.ok(typeof b.leftoverPath === "string" && b.leftoverPath.length > 0, "leftoverPath carried for the warning");
+      assert.ok((body.data.warnings || []).includes("LEFTOVER_HAS_FILES"), "warning surfaced");
+    });
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("POST /api/switch-mode: {mode:cooperative} is ACCEPTED while already cooperative (re-handover)", async () => {
+  const h = buildCoopCtx("driftReclaimable");
+  try {
+    await establishDriftedBind(h);
+    await withServer(h.ctx, async (baseUrl) => {
+      const { status, body } = await postJSON(baseUrl, "/api/switch-mode", { mode: "cooperative", confirm: true });
+      assert.equal(status, 200, "switch-mode when already cooperative must be allowed (reclaim)");
+      assert.equal(body.ok, true);
+      assert.equal(typeof body.data.jobId, "string");
+      // Drain the reclaim job so it does not outlive the test (/api/job -> {ok,data}).
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        const j = await getJSON(baseUrl, "/api/job");
+        const job = j.body && j.body.data;
+        if (!job || job.running === false) break;
+        if (Date.now() > deadline) throw new Error("reclaim job did not finish");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    });
+  } finally {
+    h.cleanup();
   }
 });
 

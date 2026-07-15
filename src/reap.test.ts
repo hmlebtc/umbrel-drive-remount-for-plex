@@ -15,7 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { reapPlan, type ReapEntry } from './reap.js';
+import { classifyLeftover, reapPlan, type LeafScan, type ReapEntry } from './reap.js';
 
 // The `dead` shorthand maps to F1's source-presence fact: a "dead" mount is one
 // whose SOURCE DEVICE is gone (sourcePresent:false); a live mount keeps its
@@ -161,4 +161,60 @@ test('F1: an empty, unmounted, label-matched dir is rmdir-only (never umounted)'
   );
   assert.deepEqual(plan.lazyUmounts, []);
   assert.deepEqual(plan.rmdirs, ['wdexternal']);
+});
+
+// ===========================================================================
+// classifyLeftover (spec §4, v0.2.1 — DATA SAFETY): a leftover subtree is only
+// 'empty-tree' (safe to clear) when EVERY node is a directory. A single file /
+// symlink / socket / device ANYWHERE makes it 'has-files' (never touched). An
+// over-cap scan is expressed by a non-dir sentinel node, so it too is has-files.
+// ===========================================================================
+
+const B = '/home/umbrel/umbrel/external/wdexternal';
+
+test('classifyLeftover: an all-empty directory tree is empty-tree', () => {
+  const scan: LeafScan = [
+    { path: `${B}/skeleton`, type: 'dir' },
+    { path: `${B}/skeleton/nested`, type: 'dir' },
+    { path: `${B}/another`, type: 'dir' },
+  ];
+  assert.equal(classifyLeftover(scan), 'empty-tree');
+});
+
+test('classifyLeftover: an empty scan (no descendants) is empty-tree', () => {
+  assert.equal(classifyLeftover([]), 'empty-tree');
+});
+
+test('classifyLeftover: a FILE at any depth makes the tree has-files', () => {
+  const scan: LeafScan = [
+    { path: `${B}/skeleton`, type: 'dir' },
+    { path: `${B}/skeleton/deep`, type: 'dir' },
+    { path: `${B}/skeleton/deep/movie.mkv`, type: 'file' }, // one file, deep
+  ];
+  assert.equal(classifyLeftover(scan), 'has-files');
+});
+
+test('classifyLeftover: a SYMLINK at any depth makes the tree has-files (never dereferenced)', () => {
+  const scan: LeafScan = [
+    { path: `${B}/skeleton`, type: 'dir' },
+    { path: `${B}/skeleton/link`, type: 'symlink' }, // a symlink is NOT an empty dir
+  ];
+  assert.equal(classifyLeftover(scan), 'has-files');
+});
+
+test('classifyLeftover: an "other" node (socket/device/fifo) makes the tree has-files', () => {
+  const scan: LeafScan = [
+    { path: `${B}/dev-node`, type: 'other' },
+  ];
+  assert.equal(classifyLeftover(scan), 'has-files');
+});
+
+test('classifyLeftover: an over-cap sentinel (non-dir node) classifies as has-files', () => {
+  // scanLeftover appends a non-directory sentinel when it hits the depth/node cap
+  // (it could not fully prove the tree empty), so classifyLeftover leaves it alone.
+  const scan: LeafScan = [
+    { path: `${B}/a`, type: 'dir' },
+    { path: `${B}/a`, type: 'other' }, // the cap sentinel
+  ];
+  assert.equal(classifyLeftover(scan), 'has-files');
 });

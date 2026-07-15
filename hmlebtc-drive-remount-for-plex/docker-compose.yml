@@ -44,7 +44,7 @@ services:
   web:
     # Pin the exact released version - never `:latest`, never `v`-prefixed.
     # Bump in lockstep with umbrel-app.yml `version:` on every release.
-    image: ghcr.io/hmlebtc/umbrel-drive-remount-for-plex:0.2.0
+    image: ghcr.io/hmlebtc/umbrel-drive-remount-for-plex:0.2.1
     restart: on-failure
     stop_grace_period: 30s
     # See the block comment above: both are required for the host-access

@@ -54,6 +54,14 @@ export interface HostAdapter {
   exists(hostPath: string): Promise<boolean>;
   /** Directory entries, or null if the path is missing / not a directory. */
   listDir(hostPath: string): Promise<string[] | null>;
+  /**
+   * lstat-based node type of a host path (spec §4 leftover scan): 'dir' | 'file'
+   * | 'symlink' | 'other', or null on ENOENT. Does NOT follow symlinks — a
+   * symlink resolves to 'symlink', never its target — so a symlink pointing at a
+   * directory can never be mistaken for an empty directory. Any non-ENOENT error
+   * maps to 'other' (the data-safe verdict: treated as a file, never auto-cleared).
+   */
+  statType(hostPath: string): Promise<'file' | 'dir' | 'symlink' | 'other' | null>;
   /** Canonical host path a symlink resolves to (e.g. by-uuid -> /dev/sdX), or null. */
   realpath(hostPath: string): Promise<string | null>;
   /** Raw text of the host mount table (/proc/1/mounts). */
@@ -139,6 +147,22 @@ export class RealHostAdapter implements HostAdapter {
       return await readdir(toHostView(hostPath));
     } catch {
       return null;
+    }
+  }
+
+  async statType(hostPath: string): Promise<'file' | 'dir' | 'symlink' | 'other' | null> {
+    try {
+      // lstat: never follows the FINAL symlink, so a symlink is reported as
+      // 'symlink' (never dereferenced to its target's type). The /proc/1/root
+      // magic prefix is resolved by the kernel during path-walk (as in exists()).
+      const st = await lstat(toHostView(hostPath));
+      if (st.isDirectory()) return 'dir';
+      if (st.isSymbolicLink()) return 'symlink';
+      if (st.isFile()) return 'file';
+      return 'other'; // socket / device / fifo / etc. — a non-directory node
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      return 'other'; // any other error (EACCES/EIO/…): data-safe non-dir verdict
     }
   }
 
